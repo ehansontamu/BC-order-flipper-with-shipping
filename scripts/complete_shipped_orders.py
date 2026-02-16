@@ -8,13 +8,17 @@ Rules (status_id=2 only):
 1) If shipping method is NOT "Ship By Weight" => move to status_id=10 (Completed) immediately.
 2) If shipping method IS "Ship By Weight":
    - Pull all tracking numbers from the order (multiple shipments supported).
+   - If there are NO tracking numbers: ALERT (but do NOT fail the run).
    - Use FedEx Track API to check ALL tracking numbers.
    - Only move the BigCommerce order to Completed when ALL tracking numbers are delivered.
 
-Caching / low BigCommerce calls:
-- Each run still lists "Shipped" orders (pagination).
-- Per order, shipping method + tracking numbers are fetched once then cached in STATE_PATH.
-- FedEx checks are rate-limited per order by MIN_FEDEX_CHECK_INTERVAL_SEC.
+Alerting:
+- If Ship By Weight orders exist with no tracking numbers, write a markdown alert file (ALERT_PATH)
+  and set GitHub Actions step output "missing_tracking=true" so a later step can open/comment an Issue.
+
+Caching:
+- Each run lists shipped orders.
+- Shipping method + tracking numbers are fetched once per order then cached.
 """
 
 from __future__ import annotations
@@ -75,6 +79,21 @@ def retry_request(func, retries: int = 8, delay: float = 2.0, backoff: float = 1
 def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
+
+
+def _write_step_output(key: str, value: str) -> None:
+    """
+    Write to GitHub Actions step outputs if GITHUB_OUTPUT is available.
+    """
+    out_path = os.getenv("GITHUB_OUTPUT")
+    if not out_path:
+        return
+    try:
+        with open(out_path, "a", encoding="utf-8") as f:
+            f.write(f"{key}={value}\n")
+    except Exception:
+        # Don't break the job over output writing
+        pass
 
 
 # ----------------------------
@@ -245,7 +264,6 @@ def fedex_summarize_one(tr: Dict[str, Any], fallback_tracking_number: str) -> Fe
                 delivered_at = dt
 
     delivered_at_iso = delivered_at.astimezone(timezone.utc).isoformat() if delivered_at else None
-
     return FedExTrackSummary(tracking_number=tn, latest_status=str(latest_status), delivered_at_utc=delivered_at_iso)
 
 
@@ -272,7 +290,7 @@ def is_ship_by_weight(shipping_method: str) -> bool:
 # ----------------------------
 def load_state(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        return {"version": 2, "orders": {}}
+        return {"version": 3, "orders": {}}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -283,6 +301,27 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
+
+
+def write_alert_markdown(alert_path: str, missing: List[Dict[str, Any]]) -> None:
+    _safe_mkdir_for_file(alert_path)
+    lines = []
+    lines.append("### Ship By Weight orders missing tracking number")
+    lines.append("")
+    lines.append(f"Found **{len(missing)}** shipped order(s) with shipping method **Ship By Weight** but no tracking number.")
+    lines.append("")
+    lines.append("| Order ID | Shipping Method | Notes |")
+    lines.append("|---:|---|---|")
+    for m in missing:
+        oid = m.get("order_id")
+        sm = (m.get("shipping_method") or "").replace("|", "\|")
+        notes = (m.get("notes") or "").replace("|", "\|")
+        lines.append(f"| {oid} | {sm} | {notes} |")
+    lines.append("")
+    lines.append("Action: Add tracking number to the shipment in BigCommerce (or adjust automation rules if this is expected).")
+    content = "\n".join(lines) + "\n"
+    with open(alert_path, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
 # ----------------------------
@@ -303,6 +342,7 @@ def main() -> int:
         raise RuntimeError("FEDEX_ENV must be 'prod' or 'sandbox'")
 
     state_path = _get_env("STATE_PATH", default=".cache/shipped_state.json")
+    alert_path = _get_env("ALERT_PATH", default=".cache/missing_tracking.md")
     min_fedex_interval = int(_get_env("MIN_FEDEX_CHECK_INTERVAL_SEC", default="600"))
     max_orders = int(_get_env("MAX_ORDERS_PER_RUN", default="0"))
     dry_run = _parse_bool(_get_env("DRY_RUN", default="false"))
@@ -322,19 +362,14 @@ def main() -> int:
     logging.info(f"Found {len(shipped_ids)} shipped orders.")
 
     # prune cache
-    removed = 0
     for oid_str in list(cached_orders.keys()):
         try:
             oid = int(oid_str)
         except Exception:
             cached_orders.pop(oid_str, None)
-            removed += 1
             continue
         if oid not in shipped_ids_set:
             cached_orders.pop(oid_str, None)
-            removed += 1
-    if removed:
-        logging.info(f"Pruned {removed} cached orders that are no longer Shipped.")
 
     # hydrate new shipped orders
     hydrated = 0
@@ -355,14 +390,35 @@ def main() -> int:
             "tracking_numbers": tracking_numbers,
             "shipping_provider": provider,
             "last_fedex_check_utc": None,
-            "tracking_status": {},      # tn -> latest_status
-            "tracking_delivered": {},   # tn -> bool
+            "tracking_status": {},
+            "tracking_delivered": {},
         }
         hydrated += 1
     if hydrated:
         logging.info(f"Hydrated {hydrated} new shipped orders into cache.")
 
-    # 1) Complete anything that is NOT Ship By Weight
+    # ALERT: Ship By Weight + no tracking
+    missing_tracking_orders: List[Dict[str, Any]] = []
+    for oid_str, info in cached_orders.items():
+        if info.get("ship_by_weight") is True:
+            tns = info.get("tracking_numbers") or []
+            if not tns:
+                missing_tracking_orders.append({
+                    "order_id": int(info.get("order_id")),
+                    "shipping_method": info.get("shipping_method"),
+                    "notes": "Ship By Weight but no tracking numbers found in /shipments or /shipping_addresses."
+                })
+
+    if missing_tracking_orders:
+        logging.warning(f"ALERT: {len(missing_tracking_orders)} Ship By Weight shipped orders have no tracking number.")
+        write_alert_markdown(alert_path, missing_tracking_orders)
+        _write_step_output("missing_tracking", "true")
+        _write_step_output("missing_tracking_count", str(len(missing_tracking_orders)))
+    else:
+        _write_step_output("missing_tracking", "false")
+        _write_step_output("missing_tracking_count", "0")
+
+    # 1) Complete anything that is NOT Ship By Weight immediately
     to_complete_immediately: List[int] = []
     for oid_str, info in list(cached_orders.items()):
         if info.get("ship_by_weight") is False:
@@ -382,7 +438,7 @@ def main() -> int:
                     continue
             cached_orders.pop(str(oid), None)
 
-    # 2) Ship By Weight => FedEx check ALL tracking numbers; complete only if ALL delivered
+    # 2) Ship By Weight => FedEx check ALL tns; complete only if ALL delivered
     tns_to_check: List[str] = []
 
     for oid_str, info in cached_orders.items():
@@ -391,7 +447,7 @@ def main() -> int:
 
         tns = info.get("tracking_numbers") or []
         if not tns:
-            continue
+            continue  # already alerted
 
         provider = str(info.get("shipping_provider") or "").strip().lower()
         if provider and "fedex" not in provider:
@@ -407,7 +463,6 @@ def main() -> int:
             if tn_clean:
                 tns_to_check.append(tn_clean)
 
-    # de-dupe
     uniq_tns: List[str] = []
     seen = set()
     for tn in tns_to_check:
@@ -513,7 +568,7 @@ def main() -> int:
                         continue
                 cached_orders.pop(str(oid), None)
 
-    state["version"] = 2
+    state["version"] = 3
     state["last_run_utc"] = now.isoformat()
     state["orders"] = cached_orders
     save_state(state_path, state)

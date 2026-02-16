@@ -2,7 +2,7 @@ name: Flip Orders In Shipped
 
 on:
   workflow_dispatch:
-  # Later, if you want it to run automatically:
+  # Later:
   # schedule:
   #   - cron: "*/15 * * * *"
 
@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: write
 
     steps:
       - name: Checkout
@@ -22,8 +23,6 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      # Cache a small state file between runs so we don't have to re-fetch
-      # shipping method / tracking # details from BigCommerce for the same shipped orders.
       - name: Restore shipped-order state cache
         uses: actions/cache@v4
         with:
@@ -38,18 +37,18 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run completion logic
+        id: run
         env:
-          # BigCommerce
           BC_STORE_ID: ${{ secrets.BC_STORE_ID }}
           BC_AUTH_TOKEN: ${{ secrets.BC_AUTH_TOKEN }}
 
-          # FedEx Track API
           FEDEX_CLIENT_ID: ${{ secrets.FEDEX_CLIENT_ID }}
           FEDEX_CLIENT_SECRET: ${{ secrets.FEDEX_CLIENT_SECRET }}
           FEDEX_ENV: prod  # or sandbox
 
-          # Script options
           STATE_PATH: .cache/shipped_state.json
+          ALERT_PATH: .cache/missing_tracking.md
+
           MIN_FEDEX_CHECK_INTERVAL_SEC: "600"   # 10 minutes
           MAX_ORDERS_PER_RUN: "0"               # 0 = no cap
           DRY_RUN: "false"
@@ -58,5 +57,53 @@ jobs:
         run: |
           python scripts/complete_shipped_orders.py
 
-      # NOTE: actions/cache@v4 automatically saves the cache at the end of the job
-      # if the primary key was not found (which is true here because we use run_id).
+      - name: Create / update GitHub Issue if Ship By Weight missing tracking
+        if: steps.run.outputs.missing_tracking == 'true'
+        uses: actions/github-script@v7
+        env:
+          ALERT_PATH: .cache/missing_tracking.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.ALERT_PATH || '.cache/missing_tracking.md';
+            const body = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'See workflow logs for details.';
+            const title = 'ALERT: Ship By Weight orders missing tracking number';
+            const labels = ['ops','shipping','alert'];
+
+            // Look for an existing open issue with this exact title (to avoid spam).
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `New occurrence detected in run ${context.runId}:
+
+${body}`
+              });
+              // Ensure labels exist
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                labels
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body: `Detected in run ${context.runId}:
+
+${body}`,
+                labels
+              });
+            }
