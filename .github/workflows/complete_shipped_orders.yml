@@ -1,4 +1,4 @@
-name: Complete Shipped Orders
+name: Flip Orders In Shipped
 
 on:
   workflow_dispatch:
