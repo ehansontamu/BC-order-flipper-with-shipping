@@ -4,31 +4,17 @@
 """
 complete_shipped_orders.py
 
-Goal:
-- Pull all BigCommerce orders in status_id=2 (Shipped).
-- If shipping method is "On Campus Delivery" (no tracking), move to status_id=10 (Completed).
-- If shipping is "Ship By Weight" and a FedEx tracking number exists, call FedEx Track API.
-  If delivered, move to status_id=10 (Completed).
+Rules (status_id=2 only):
+1) If shipping method is NOT "Ship By Weight" => move to status_id=10 (Completed) immediately.
+2) If shipping method IS "Ship By Weight":
+   - Pull all tracking numbers from the order (multiple shipments supported).
+   - Use FedEx Track API to check ALL tracking numbers.
+   - Only move the BigCommerce order to Completed when ALL tracking numbers are delivered.
 
 Caching / low BigCommerce calls:
-- We still list the "Shipped" orders each run (pagination).
-- For each shipped order, we only fetch shipping-method + tracking numbers from BigCommerce
-  the *first* time we see that order (stored in STATE_PATH). After that, we reuse cached info.
-- For FedEx, we optionally rate-limit checks per order via MIN_FEDEX_CHECK_INTERVAL_SEC.
-
-Required env vars:
-- BC_STORE_ID
-- BC_AUTH_TOKEN
-- FEDEX_CLIENT_ID
-- FEDEX_CLIENT_SECRET
-
-Optional env vars:
-- FEDEX_ENV (prod|sandbox) default: prod
-- STATE_PATH default: .cache/shipped_state.json
-- MIN_FEDEX_CHECK_INTERVAL_SEC default: 600
-- MAX_ORDERS_PER_RUN default: 0 (no cap)
-- DRY_RUN default: false
-- LOG_LEVEL default: INFO
+- Each run still lists "Shipped" orders (pagination).
+- Per order, shipping method + tracking numbers are fetched once then cached in STATE_PATH.
+- FedEx checks are rate-limited per order by MIN_FEDEX_CHECK_INTERVAL_SEC.
 """
 
 from __future__ import annotations
@@ -52,9 +38,6 @@ FEDEX_BASE_URLS = {
 }
 
 
-# ----------------------------
-# Utilities
-# ----------------------------
 def _get_env(name: str, required: bool = False, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
     if required and (val is None or str(val).strip() == ""):
@@ -87,6 +70,11 @@ def retry_request(func, retries: int = 8, delay: float = 2.0, backoff: float = 1
             time.sleep(delay)
             delay *= backoff
     raise RuntimeError(f"Max retries reached for an API call. Last error: {last_err}")
+
+
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
 
 # ----------------------------
@@ -125,10 +113,6 @@ def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
 
 
 def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
-    """
-    Returns the full list of orders for the given status_id.
-    Uses /v2/orders?status_id=...&page=...&limit=... (v2 pagination).
-    """
     orders: List[Dict[str, Any]] = []
     page = 1
 
@@ -148,9 +132,6 @@ def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> Li
 
 
 def fetch_shipping_method(store_id: str, order_id: int) -> str:
-    """
-    Fetch shipping method from /v2/orders/{order_id}/shipping_addresses
-    """
     url = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
     addrs = bc_get_json(url)
     if isinstance(addrs, list) and addrs:
@@ -159,19 +140,9 @@ def fetch_shipping_method(store_id: str, order_id: int) -> str:
 
 
 def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[List[str], str]:
-    """
-    Fetch tracking numbers primarily from:
-      GET /v2/orders/{order_id}/shipments
-
-    Fallback (some setups put it on the shipping address):
-      GET /v2/orders/{order_id}/shipping_addresses
-
-    Returns: (tracking_numbers, shipping_provider_guess)
-    """
     tracking_numbers: List[str] = []
     provider = ""
 
-    # Primary: shipments
     url_ship = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipments"
     shipments = bc_get_json(url_ship)
 
@@ -183,7 +154,6 @@ def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[L
             if not provider:
                 provider = (sh.get("shipping_provider", "") or "").strip()
 
-    # Fallback: shipping address may contain tracking_number
     if not tracking_numbers:
         url_addr = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
         addrs = bc_get_json(url_addr)
@@ -193,13 +163,13 @@ def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[L
                 if tn:
                     tracking_numbers.append(tn)
 
-    # de-dupe preserving order
     deduped: List[str] = []
     seen = set()
     for tn in tracking_numbers:
-        if tn not in seen:
-            seen.add(tn)
-            deduped.append(tn)
+        tn2 = tn.strip()
+        if tn2 and tn2 not in seen:
+            seen.add(tn2)
+            deduped.append(tn2)
 
     return deduped, provider
 
@@ -230,9 +200,6 @@ def fedex_get_access_token(base_url: str, client_id: str, client_secret: str) ->
 
 
 def fedex_track_bulk(base_url: str, token: str, tracking_numbers: List[str]) -> Dict[str, Any]:
-    """
-    FedEx Track endpoint supports up to 30 tracking numbers per request.
-    """
     url = f"{base_url}/track/v1/trackingnumbers"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     payload = {"includeDetailedScans": True, "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": tn}} for tn in tracking_numbers]}
@@ -259,8 +226,6 @@ class FedExTrackSummary:
     tracking_number: str
     latest_status: str
     delivered_at_utc: Optional[str]
-    last_scan_at_utc: Optional[str]
-    raw: Dict[str, Any]
 
 
 def fedex_summarize_one(tr: Dict[str, Any], fallback_tracking_number: str) -> FedExTrackSummary:
@@ -270,41 +235,18 @@ def fedex_summarize_one(tr: Dict[str, Any], fallback_tracking_number: str) -> Fe
         tn = str(tni["trackingNumber"])
 
     latest = tr.get("latestStatusDetail") or {}
-    latest_status = (
-        latest.get("description")
-        or latest.get("statusByLocale")
-        or latest.get("code")
-        or "Unknown"
-    )
+    latest_status = latest.get("description") or latest.get("statusByLocale") or latest.get("code") or "Unknown"
 
     delivered_at: Optional[datetime] = None
-    last_scan_at: Optional[datetime] = None
-
     for item in (tr.get("dateAndTimes") or []):
         if isinstance(item, dict) and item.get("type") == "ACTUAL_DELIVERY":
             dt = _parse_dt(item.get("dateTime"))
             if dt:
                 delivered_at = dt
 
-    scan_events = tr.get("scanEvents") or []
-    if isinstance(scan_events, list) and scan_events:
-        scan_events_sorted = sorted(
-            scan_events,
-            key=lambda e: _parse_dt(e.get("date")) or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-        last_scan_at = _parse_dt(scan_events_sorted[0].get("date"))
-
     delivered_at_iso = delivered_at.astimezone(timezone.utc).isoformat() if delivered_at else None
-    last_scan_iso = last_scan_at.astimezone(timezone.utc).isoformat() if last_scan_at else None
 
-    return FedExTrackSummary(
-        tracking_number=tn,
-        latest_status=str(latest_status),
-        delivered_at_utc=delivered_at_iso,
-        last_scan_at_utc=last_scan_iso,
-        raw=tr,
-    )
+    return FedExTrackSummary(tracking_number=tn, latest_status=str(latest_status), delivered_at_utc=delivered_at_iso)
 
 
 def fedex_is_delivered(summary: FedExTrackSummary) -> bool:
@@ -314,11 +256,23 @@ def fedex_is_delivered(summary: FedExTrackSummary) -> bool:
 
 
 # ----------------------------
+# Shipping-method rules
+# ----------------------------
+def normalize(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+def is_ship_by_weight(shipping_method: str) -> bool:
+    sm = normalize(shipping_method)
+    return sm == "ship by weight" or "ship by weight" in sm
+
+
+# ----------------------------
 # State
 # ----------------------------
 def load_state(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        return {"version": 1, "orders": {}}
+        return {"version": 2, "orders": {}}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -331,17 +285,8 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def normalize_shipping_method(s: str) -> str:
-    return " ".join(s.strip().lower().split())
-
-
-def is_on_campus_delivery(shipping_method: str) -> bool:
-    sm = normalize_shipping_method(shipping_method)
-    return sm == "on campus delivery" or "on campus delivery" in sm
-
-
 # ----------------------------
-# Main logic
+# Main
 # ----------------------------
 def main() -> int:
     log_level = _get_env("LOG_LEVEL", default="INFO").upper()
@@ -376,6 +321,7 @@ def main() -> int:
     shipped_ids_set = set(shipped_ids)
     logging.info(f"Found {len(shipped_ids)} shipped orders.")
 
+    # prune cache
     removed = 0
     for oid_str in list(cached_orders.keys()):
         try:
@@ -390,6 +336,7 @@ def main() -> int:
     if removed:
         logging.info(f"Pruned {removed} cached orders that are no longer Shipped.")
 
+    # hydrate new shipped orders
     hydrated = 0
     for oid in shipped_ids:
         if max_orders and hydrated >= max_orders:
@@ -404,24 +351,26 @@ def main() -> int:
         cached_orders[oid_key] = {
             "order_id": oid,
             "shipping_method": shipping_method,
-            "is_campus": is_on_campus_delivery(shipping_method),
+            "ship_by_weight": is_ship_by_weight(shipping_method),
             "tracking_numbers": tracking_numbers,
             "shipping_provider": provider,
             "last_fedex_check_utc": None,
-            "last_fedex_status": None,
-            "delivered": False,
+            "tracking_status": {},      # tn -> latest_status
+            "tracking_delivered": {},   # tn -> bool
         }
         hydrated += 1
-
     if hydrated:
         logging.info(f"Hydrated {hydrated} new shipped orders into cache.")
 
-    # 1) Complete On Campus Delivery
-    to_complete_campus: List[int] = [int(info["order_id"]) for info in cached_orders.values() if info.get("is_campus") is True]
+    # 1) Complete anything that is NOT Ship By Weight
+    to_complete_immediately: List[int] = []
+    for oid_str, info in list(cached_orders.items()):
+        if info.get("ship_by_weight") is False:
+            to_complete_immediately.append(int(info["order_id"]))
 
-    if to_complete_campus:
-        logging.info(f"On Campus Delivery: {len(to_complete_campus)} orders to mark Completed.")
-        for oid in to_complete_campus:
+    if to_complete_immediately:
+        logging.info(f"Immediate completion (NOT Ship By Weight): {len(to_complete_immediately)} orders.")
+        for oid in to_complete_immediately:
             if dry_run:
                 logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
             else:
@@ -433,15 +382,18 @@ def main() -> int:
                     continue
             cached_orders.pop(str(oid), None)
 
-    # 2) FedEx tracking checks
-    track_jobs: List[Tuple[int, str]] = []
-    for oid_str, info in cached_orders.items():
-        oid = int(info.get("order_id"))
-        tns = info.get("tracking_numbers") or []
-        provider = str(info.get("shipping_provider") or "").strip().lower()
+    # 2) Ship By Weight => FedEx check ALL tracking numbers; complete only if ALL delivered
+    tns_to_check: List[str] = []
 
+    for oid_str, info in cached_orders.items():
+        if info.get("ship_by_weight") is not True:
+            continue
+
+        tns = info.get("tracking_numbers") or []
         if not tns:
             continue
+
+        provider = str(info.get("shipping_provider") or "").strip().lower()
         if provider and "fedex" not in provider:
             continue
 
@@ -450,20 +402,27 @@ def main() -> int:
         if last_check_dt and (now - last_check_dt).total_seconds() < min_fedex_interval:
             continue
 
-        track_jobs.append((oid, str(tns[0])))
+        for tn in tns:
+            tn_clean = str(tn).strip()
+            if tn_clean:
+                tns_to_check.append(tn_clean)
 
-    if track_jobs:
-        logging.info(f"FedEx checks needed this run: {len(track_jobs)}")
+    # de-dupe
+    uniq_tns: List[str] = []
+    seen = set()
+    for tn in tns_to_check:
+        if tn not in seen:
+            seen.add(tn)
+            uniq_tns.append(tn)
+
+    if uniq_tns:
+        logging.info(f"FedEx checks needed this run (tracking #s): {len(uniq_tns)}")
         token = fedex_get_access_token(base_url, fedex_client_id, fedex_client_secret)
 
-        def chunks(lst, n):
-            for i in range(0, len(lst), n):
-                yield lst[i:i+n]
+        tn_delivered: Dict[str, bool] = {}
+        tn_status: Dict[str, str] = {}
 
-        tn_to_oid: Dict[str, int] = {tn: oid for oid, tn in track_jobs}
-        delivered_orders: List[int] = []
-
-        for batch in chunks([tn for _, tn in track_jobs], 30):
+        for batch in chunks(uniq_tns, 30):
             try:
                 resp = fedex_track_bulk(base_url, token, batch)
             except Exception as e:
@@ -490,25 +449,59 @@ def main() -> int:
                     continue
 
                 summary = fedex_summarize_one(tr0, tn_guess)
-                oid = tn_to_oid.get(summary.tracking_number) or tn_to_oid.get(summary.tracking_number.replace(" ", ""))
-                if not oid:
+                delivered = fedex_is_delivered(summary)
+
+                tn_delivered[summary.tracking_number] = delivered
+                tn_status[summary.tracking_number] = summary.latest_status
+
+        to_complete_after_fedex: List[int] = []
+
+        for oid_str, info in cached_orders.items():
+            if info.get("ship_by_weight") is not True:
+                continue
+            tns = info.get("tracking_numbers") or []
+            if not tns:
+                continue
+
+            info["last_fedex_check_utc"] = now.isoformat()
+            tracking_delivered = info.get("tracking_delivered") or {}
+            tracking_status = info.get("tracking_status") or {}
+
+            for tn in tns:
+                tn_clean = str(tn).strip()
+                if not tn_clean:
                     continue
 
-                info = cached_orders.get(str(oid))
-                if not info:
-                    continue
+                delivered = tn_delivered.get(tn_clean)
+                status = tn_status.get(tn_clean)
 
-                info["last_fedex_check_utc"] = now.isoformat()
-                info["last_fedex_status"] = summary.latest_status
+                if delivered is None:
+                    tn_nospace = tn_clean.replace(" ", "")
+                    delivered = tn_delivered.get(tn_nospace)
+                    status = status or tn_status.get(tn_nospace)
 
-                if fedex_is_delivered(summary):
-                    info["delivered"] = True
-                    delivered_orders.append(oid)
-                    logging.info(f"FedEx delivered: order {oid} tracking {summary.tracking_number} status='{summary.latest_status}'")
+                if delivered is not None:
+                    tracking_delivered[tn_clean] = bool(delivered)
+                if status is not None:
+                    tracking_status[tn_clean] = str(status)
 
-        if delivered_orders:
-            logging.info(f"Marking {len(delivered_orders)} orders Completed based on FedEx delivery...")
-            for oid in delivered_orders:
+            info["tracking_delivered"] = tracking_delivered
+            info["tracking_status"] = tracking_status
+
+            all_delivered = True
+            for tn in tns:
+                tn_clean = str(tn).strip()
+                if tn_clean and tracking_delivered.get(tn_clean) is not True:
+                    all_delivered = False
+                    break
+
+            if all_delivered:
+                to_complete_after_fedex.append(int(info["order_id"]))
+                logging.info(f"All tracking numbers delivered => complete order {info['order_id']} (tns={tns})")
+
+        if to_complete_after_fedex:
+            logging.info(f"Marking {len(to_complete_after_fedex)} Ship By Weight orders Completed (ALL tns delivered).")
+            for oid in to_complete_after_fedex:
                 if dry_run:
                     logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
                 else:
@@ -520,10 +513,9 @@ def main() -> int:
                         continue
                 cached_orders.pop(str(oid), None)
 
-    state["version"] = 1
+    state["version"] = 2
     state["last_run_utc"] = now.isoformat()
     state["orders"] = cached_orders
-
     save_state(state_path, state)
     logging.info(f"Saved state to {state_path}. Cached shipped orders remaining: {len(cached_orders)}")
     return 0
