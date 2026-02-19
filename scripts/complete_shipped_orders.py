@@ -18,7 +18,8 @@ Alerting:
 
 Caching:
 - Each run lists shipped orders.
-- Shipping method + tracking numbers are fetched once per order then cached.
+- For non-Ship-By-Weight orders we do NOT call /shipments at all (prevents failures like non-JSON responses).
+- For Ship By Weight orders we cache shipping method + tracking numbers and re-check FedEx on an interval.
 """
 
 from __future__ import annotations
@@ -42,6 +43,9 @@ FEDEX_BASE_URLS = {
 }
 
 
+# ----------------------------
+# Utilities
+# ----------------------------
 def _get_env(name: str, required: bool = False, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
     if required and (val is None or str(val).strip() == ""):
@@ -78,7 +82,7 @@ def retry_request(func, retries: int = 8, delay: float = 2.0, backoff: float = 1
 
 def chunks(lst, n):
     for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+        yield lst[i : i + n]
 
 
 def _write_step_output(key: str, value: str) -> None:
@@ -108,27 +112,63 @@ def bc_headers() -> Dict[str, str]:
 
 
 def bc_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Any:
+    """
+    BigCommerce GET helper with clearer errors when BigCommerce returns non-JSON (HTML/empty/etc).
+    """
     def _do():
         return requests.get(url, headers=bc_headers(), params=params, timeout=timeout)
 
     resp = retry_request(_do)
+
     if resp.status_code >= 400:
-        raise requests.HTTPError(f"BigCommerce GET failed {resp.status_code} {url}: {resp.text[:500]}", response=resp)
+        raise requests.HTTPError(
+            f"BigCommerce GET failed {resp.status_code} {url}: {resp.text[:500]}",
+            response=resp,
+        )
+
+    # Empty body sometimes happens; treat as empty JSON-ish list for our use cases.
+    if not resp.text or not resp.text.strip():
+        logging.warning(f"BigCommerce GET returned empty body for {url} (treating as empty list).")
+        return []
+
+    # If Content-Type isn't JSON, provide a better diagnostic than JSONDecodeError.
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "json" not in ctype:
+        raise RuntimeError(
+            f"BigCommerce returned non-JSON for {url} (Content-Type={ctype}). "
+            f"First 500 chars: {resp.text[:500]}"
+        )
+
     return resp.json()
 
 
 def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
+    """
+    BigCommerce PUT helper that handles empty/non-JSON responses more gracefully.
+    """
     def _do():
         return requests.put(url, headers=bc_headers(), json=payload, timeout=timeout)
 
     resp = retry_request(_do)
-    if resp.status_code >= 400:
-        raise requests.HTTPError(f"BigCommerce PUT failed {resp.status_code} {url}: {resp.text[:500]}", response=resp)
 
-    try:
-        return resp.json()
-    except Exception:
-        return {"status_code": resp.status_code, "text": resp.text}
+    if resp.status_code >= 400:
+        raise requests.HTTPError(
+            f"BigCommerce PUT failed {resp.status_code} {url}: {resp.text[:500]}",
+            response=resp,
+        )
+
+    # BigCommerce sometimes returns an empty body on PUT; that's fine.
+    if not resp.text or not resp.text.strip():
+        return {"status_code": resp.status_code}
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "json" in ctype:
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text[:500]}
+
+    return {"status_code": resp.status_code, "text": resp.text[:500]}
 
 
 def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
@@ -159,6 +199,10 @@ def fetch_shipping_method(store_id: str, order_id: int) -> str:
 
 
 def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[List[str], str]:
+    """
+    Supports multiple shipments: pulls tracking_number from each shipment.
+    Also attempts fallback from shipping_addresses.tracking_number if shipments are empty.
+    """
     tracking_numbers: List[str] = []
     provider = ""
 
@@ -221,7 +265,10 @@ def fedex_get_access_token(base_url: str, client_id: str, client_secret: str) ->
 def fedex_track_bulk(base_url: str, token: str, tracking_numbers: List[str]) -> Dict[str, Any]:
     url = f"{base_url}/track/v1/trackingnumbers"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-    payload = {"includeDetailedScans": True, "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": tn}} for tn in tracking_numbers]}
+    payload = {
+        "includeDetailedScans": True,
+        "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": tn}} for tn in tracking_numbers],
+    }
 
     def _do():
         return requests.post(url, headers=headers, json=payload, timeout=30)
@@ -308,7 +355,9 @@ def write_alert_markdown(alert_path: str, missing: List[Dict[str, Any]]) -> None
     lines = []
     lines.append("### Ship By Weight orders missing tracking number")
     lines.append("")
-    lines.append(f"Found **{len(missing)}** shipped order(s) with shipping method **Ship By Weight** but no tracking number.")
+    lines.append(
+        f"Found **{len(missing)}** shipped order(s) with shipping method **Ship By Weight** but no tracking number."
+    )
     lines.append("")
     lines.append("| Order ID | Shipping Method | Notes |")
     lines.append("|---:|---|---|")
@@ -329,7 +378,10 @@ def write_alert_markdown(alert_path: str, missing: List[Dict[str, Any]]) -> None
 # ----------------------------
 def main() -> int:
     log_level = _get_env("LOG_LEVEL", default="INFO").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
     store_id = _get_env("BC_STORE_ID", required=True)
     shipped_status_id = 2
@@ -361,7 +413,7 @@ def main() -> int:
     shipped_ids_set = set(shipped_ids)
     logging.info(f"Found {len(shipped_ids)} shipped orders.")
 
-    # prune cache
+    # prune cache for orders that are no longer in shipped
     for oid_str in list(cached_orders.keys()):
         try:
             oid = int(oid_str)
@@ -376,17 +428,40 @@ def main() -> int:
     for oid in shipped_ids:
         if max_orders and hydrated >= max_orders:
             break
+
         oid_key = str(oid)
         if oid_key in cached_orders:
             continue
 
         shipping_method = fetch_shipping_method(store_id, oid)
-        tracking_numbers, provider = fetch_tracking_numbers_and_provider(store_id, oid)
+        ship_by_weight = is_ship_by_weight(shipping_method)
+
+        # IMPORTANT: For NOT Ship By Weight, do NOT call /shipments (prevents non-JSON / empty-body crashes).
+        if not ship_by_weight:
+            cached_orders[oid_key] = {
+                "order_id": oid,
+                "shipping_method": shipping_method,
+                "ship_by_weight": False,
+                "tracking_numbers": [],
+                "shipping_provider": "",
+                "last_fedex_check_utc": None,
+                "tracking_status": {},
+                "tracking_delivered": {},
+            }
+            hydrated += 1
+            continue
+
+        # Ship By Weight: now fetch tracking numbers/provider.
+        try:
+            tracking_numbers, provider = fetch_tracking_numbers_and_provider(store_id, oid)
+        except Exception as e:
+            logging.error(f"Failed to fetch shipments/tracking for order {oid}: {e}")
+            tracking_numbers, provider = [], ""
 
         cached_orders[oid_key] = {
             "order_id": oid,
             "shipping_method": shipping_method,
-            "ship_by_weight": is_ship_by_weight(shipping_method),
+            "ship_by_weight": True,
             "tracking_numbers": tracking_numbers,
             "shipping_provider": provider,
             "last_fedex_check_utc": None,
@@ -394,23 +469,28 @@ def main() -> int:
             "tracking_delivered": {},
         }
         hydrated += 1
+
     if hydrated:
         logging.info(f"Hydrated {hydrated} new shipped orders into cache.")
 
     # ALERT: Ship By Weight + no tracking
     missing_tracking_orders: List[Dict[str, Any]] = []
-    for oid_str, info in cached_orders.items():
+    for _, info in cached_orders.items():
         if info.get("ship_by_weight") is True:
             tns = info.get("tracking_numbers") or []
             if not tns:
-                missing_tracking_orders.append({
-                    "order_id": int(info.get("order_id")),
-                    "shipping_method": info.get("shipping_method"),
-                    "notes": "Ship By Weight but no tracking numbers found in /shipments or /shipping_addresses."
-                })
+                missing_tracking_orders.append(
+                    {
+                        "order_id": int(info.get("order_id")),
+                        "shipping_method": info.get("shipping_method"),
+                        "notes": "Ship By Weight but no tracking numbers found in /shipments or /shipping_addresses.",
+                    }
+                )
 
     if missing_tracking_orders:
-        logging.warning(f"ALERT: {len(missing_tracking_orders)} Ship By Weight shipped orders have no tracking number.")
+        logging.warning(
+            f"ALERT: {len(missing_tracking_orders)} Ship By Weight shipped orders have no tracking number."
+        )
         write_alert_markdown(alert_path, missing_tracking_orders)
         _write_step_output("missing_tracking", "true")
         _write_step_output("missing_tracking_count", str(len(missing_tracking_orders)))
@@ -420,7 +500,7 @@ def main() -> int:
 
     # 1) Complete anything that is NOT Ship By Weight immediately
     to_complete_immediately: List[int] = []
-    for oid_str, info in list(cached_orders.items()):
+    for _, info in list(cached_orders.items()):
         if info.get("ship_by_weight") is False:
             to_complete_immediately.append(int(info["order_id"]))
 
@@ -441,7 +521,7 @@ def main() -> int:
     # 2) Ship By Weight => FedEx check ALL tns; complete only if ALL delivered
     tns_to_check: List[str] = []
 
-    for oid_str, info in cached_orders.items():
+    for _, info in cached_orders.items():
         if info.get("ship_by_weight") is not True:
             continue
 
@@ -450,6 +530,7 @@ def main() -> int:
             continue  # already alerted
 
         provider = str(info.get("shipping_provider") or "").strip().lower()
+        # If provider is set and not FedEx, skip FedEx checks.
         if provider and "fedex" not in provider:
             continue
 
@@ -511,7 +592,7 @@ def main() -> int:
 
         to_complete_after_fedex: List[int] = []
 
-        for oid_str, info in cached_orders.items():
+        for _, info in cached_orders.items():
             if info.get("ship_by_weight") is not True:
                 continue
             tns = info.get("tracking_numbers") or []
@@ -530,6 +611,7 @@ def main() -> int:
                 delivered = tn_delivered.get(tn_clean)
                 status = tn_status.get(tn_clean)
 
+                # Try again with spaces removed (occasionally FedEx returns normalized values)
                 if delivered is None:
                     tn_nospace = tn_clean.replace(" ", "")
                     delivered = tn_delivered.get(tn_nospace)
@@ -552,10 +634,14 @@ def main() -> int:
 
             if all_delivered:
                 to_complete_after_fedex.append(int(info["order_id"]))
-                logging.info(f"All tracking numbers delivered => complete order {info['order_id']} (tns={tns})")
+                logging.info(
+                    f"All tracking numbers delivered => complete order {info['order_id']} (tns={tns})"
+                )
 
         if to_complete_after_fedex:
-            logging.info(f"Marking {len(to_complete_after_fedex)} Ship By Weight orders Completed (ALL tns delivered).")
+            logging.info(
+                f"Marking {len(to_complete_after_fedex)} Ship By Weight orders Completed (ALL tns delivered)."
+            )
             for oid in to_complete_after_fedex:
                 if dry_run:
                     logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
