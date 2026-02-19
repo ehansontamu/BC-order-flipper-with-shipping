@@ -5,6 +5,11 @@ on:
   # Later:
   # schedule:
   #   - cron: "*/15 * * * *"
+  
+ concurrency:
+  group: flip-orders-in-shipped
+  cancel-in-progress: false
+
 
 jobs:
   complete:
