@@ -14,6 +14,7 @@ Rules (status_id=2 only):
    - Only move the BigCommerce order to Completed when:
        * there are NO missing tracking numbers,
        * there are NO invalid tracking numbers,
+       * there are NO unrecognized-by-FedEx tracking numbers,
        * and ALL tracking numbers are delivered.
 
 Alerting:
@@ -25,11 +26,6 @@ Caching:
 - Each run lists shipped orders.
 - Shipping method + tracking numbers are fetched once per order then cached.
 - Cache prunes itself when an order is no longer in Shipped status.
-
-Notes:
-- Tracking format validation is heuristic. FedEx tracking numbers are commonly 12 or 15 digits, sometimes 20 or 22.
-  This script flags obviously-bad values (too short, illegal characters), and still allows “unknown-but-plausible”
-  values through to the FedEx API.
 """
 
 from __future__ import annotations
@@ -156,106 +152,185 @@ def classify_tracking_number(raw: str) -> Tuple[bool, str]:
     if len(compact) < 8:
         return True, "too_short"
 
+    # digits-only: bless common FedEx lengths, but don't mark others invalid
     if _DIGITS_ONLY.match(compact):
         if len(compact) in {12, 15, 20, 22}:
             return False, "looks_like_fedex_common_length"
         return False, "digits_unknown_length"
 
+    # alphanumeric (door tag / ref / etc) - not obviously invalid
     return False, "alphanumeric_unknown_format"
 
 
 # ----------------------------
 # BigCommerce
 # ----------------------------
-def bc_headers(auth_token: str) -> Dict[str, str]:
+def bc_headers() -> Dict[str, str]:
     return {
-        "X-Auth-Token": auth_token,
+        "X-Auth-Token": _get_env("BC_AUTH_TOKEN", required=True),
         "Accept": "application/json",
         "Content-Type": "application/json",
+        "User-Agent": "BC-order-flipper-with-shipping/1.0",
     }
 
 
-def bc_get_json(auth_token: str, url: str, params: dict | None = None, *, timeout: int = 30, max_retries: int = 4):
-    """
-    GET JSON with retries and strong diagnostics.
-    """
-    headers = bc_headers(auth_token)
+def _bc_snip(resp: requests.Response, limit: int = 500) -> str:
+    try:
+        text = resp.text or ""
+        return text[:limit].replace("\n", " ").replace("\r", " ")
+    except Exception:
+        return ""
 
+
+def bc_get_json_list(url: str, params: dict | None = None, *, timeout: int = 30, max_retries: int = 4) -> List[Any]:
+    """
+    GET a BigCommerce endpoint that is expected to return a JSON LIST.
+    IMPORTANT: If BigCommerce returns 204 No Content (or a 2xx with empty body),
+    treat it as [] instead of hard-failing.
+    """
     backoff = 2.0
     for attempt in range(1, max_retries + 1):
-        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-
+        resp = requests.get(url, headers=bc_headers(), params=params, timeout=timeout)
         status = resp.status_code
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        text = resp.text or ""
-        snippet = text[:500].replace("\n", " ").replace("\r", " ")
 
         # Retryable statuses
         if status in (429, 500, 502, 503, 504):
             logging.warning(
                 "BigCommerce %s for %s (attempt %d/%d). Body snippet: %s",
-                status, url, attempt, max_retries, snippet
+                status, url, attempt, max_retries, _bc_snip(resp),
             )
             time.sleep(backoff)
             backoff *= 2
             continue
 
-        # Hard failures with clear messaging
+        # Auth / perms
         if status in (401, 403):
             raise RuntimeError(
                 f"BigCommerce auth error {status} calling {url}. "
-                f"Check BC_AUTH_TOKEN (and store scope). Body snippet: {snippet}"
+                f"Check BC_AUTH_TOKEN (scopes) and BC_STORE_ID. Body snippet: {_bc_snip(resp)}"
             )
+
+        # Wrong store / path
         if status == 404:
             raise RuntimeError(
                 f"BigCommerce 404 calling {url}. "
-                f"Often means BC_STORE_ID is wrong/empty or endpoint path is wrong. Body snippet: {snippet}"
+                f"Often means BC_STORE_ID is wrong/empty or endpoint path is wrong. Body snippet: {_bc_snip(resp)}"
             )
 
-        # Any other non-2xx
+        # Non-2xx
         if not (200 <= status < 300):
-            raise RuntimeError(
-                f"BigCommerce HTTP {status} calling {url}. Body snippet: {snippet}"
-            )
+            raise RuntimeError(f"BigCommerce HTTP {status} calling {url}. Body snippet: {_bc_snip(resp)}")
 
-        # JSON decode with better diagnostics
+        # 204 or empty body => treat as empty list
+        text = (resp.text or "").strip()
+        if status == 204 or text == "":
+            return []
+
+        # Parse JSON list
         try:
-            return resp.json()
+            data = resp.json()
         except Exception:
             raise RuntimeError(
-                f"BigCommerce returned non-JSON for {url} (HTTP {status}, Content-Type={ctype}). "
-                f"Body snippet: {snippet}"
+                f"BigCommerce returned non-JSON for {url} (HTTP {status}). "
+                f"Content-Type={(resp.headers.get('Content-Type') or '')}. Body snippet: {_bc_snip(resp)}"
             )
+
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected BigCommerce response type for list endpoint. Got: {type(data)}")
+        return data
 
     raise RuntimeError(f"BigCommerce failed after {max_retries} retries for {url}.")
 
 
-def bc_put_json(auth_token: str, url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
+def bc_get_json_obj(url: str, params: dict | None = None, *, timeout: int = 30, max_retries: int = 4) -> Optional[Dict[str, Any]]:
+    """
+    GET a BigCommerce endpoint that is expected to return a JSON OBJECT (dict),
+    or sometimes an empty response.
+    - 204 or empty body => returns None
+    """
+    backoff = 2.0
+    for attempt in range(1, max_retries + 1):
+        resp = requests.get(url, headers=bc_headers(), params=params, timeout=timeout)
+        status = resp.status_code
+
+        if status in (429, 500, 502, 503, 504):
+            logging.warning(
+                "BigCommerce %s for %s (attempt %d/%d). Body snippet: %s",
+                status, url, attempt, max_retries, _bc_snip(resp),
+            )
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        if status in (401, 403):
+            raise RuntimeError(
+                f"BigCommerce auth error {status} calling {url}. "
+                f"Check BC_AUTH_TOKEN (scopes) and BC_STORE_ID. Body snippet: {_bc_snip(resp)}"
+            )
+        if status == 404:
+            raise RuntimeError(
+                f"BigCommerce 404 calling {url}. "
+                f"Often means BC_STORE_ID is wrong/empty or endpoint path is wrong. Body snippet: {_bc_snip(resp)}"
+            )
+        if not (200 <= status < 300):
+            raise RuntimeError(f"BigCommerce HTTP {status} calling {url}. Body snippet: {_bc_snip(resp)}")
+
+        text = (resp.text or "").strip()
+        if status == 204 or text == "":
+            return None
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError(
+                f"BigCommerce returned non-JSON for {url} (HTTP {status}). "
+                f"Content-Type={(resp.headers.get('Content-Type') or '')}. Body snippet: {_bc_snip(resp)}"
+            )
+
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected BigCommerce response type for object endpoint. Got: {type(data)}")
+        return data
+
+    raise RuntimeError(f"BigCommerce failed after {max_retries} retries for {url}.")
+
+
+def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
     def _do():
-        return requests.put(url, headers=bc_headers(auth_token), json=payload, timeout=timeout)
+        return requests.put(url, headers=bc_headers(), json=payload, timeout=timeout)
 
     resp = retry_request(_do)
     if resp.status_code >= 400:
         raise requests.HTTPError(f"BigCommerce PUT failed {resp.status_code} {url}: {resp.text[:500]}", response=resp)
 
     try:
+        # PUT sometimes returns empty body; that's fine.
+        text = (resp.text or "").strip()
+        if text == "":
+            return {"status_code": resp.status_code}
         return resp.json()
     except Exception:
         return {"status_code": resp.status_code, "text": resp.text}
 
 
-def list_orders_by_status(auth_token: str, store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
+def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
     orders: List[Dict[str, Any]] = []
     page = 1
 
     while True:
         url = f"{BC_BASE_URL}/{store_id}/v2/orders"
-        batch = bc_get_json(auth_token, url, params={"status_id": status_id, "page": page, "limit": limit})
-        if not isinstance(batch, list):
-            raise RuntimeError(f"Unexpected BigCommerce orders response (expected list). Got: {type(batch)}")
+        batch = bc_get_json_list(url, params={"status_id": status_id, "page": page, "limit": limit})
         if not batch:
             break
-        orders.extend(batch)
+
+        # batch should be list of dicts
+        for item in batch:
+            if isinstance(item, dict):
+                orders.append(item)
+
         if len(batch) < limit:
             break
         page += 1
@@ -263,15 +338,15 @@ def list_orders_by_status(auth_token: str, store_id: str, status_id: int, limit:
     return orders
 
 
-def fetch_shipping_method(auth_token: str, store_id: str, order_id: int) -> str:
+def fetch_shipping_method(store_id: str, order_id: int) -> str:
     url = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
-    addrs = bc_get_json(auth_token, url)
-    if isinstance(addrs, list) and addrs:
+    addrs = bc_get_json_list(url)
+    if addrs and isinstance(addrs[0], dict):
         return (addrs[0].get("shipping_method", "") or "").strip()
     return ""
 
 
-def fetch_tracking_numbers_and_provider(auth_token: str, store_id: str, order_id: int) -> Tuple[List[str], str]:
+def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[List[str], str]:
     """
     Pull tracking numbers from shipments endpoint; if empty, fall back to shipping_addresses.
     Dedupes and preserves order.
@@ -280,28 +355,30 @@ def fetch_tracking_numbers_and_provider(auth_token: str, store_id: str, order_id
     provider = ""
 
     url_ship = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipments"
-    shipments = bc_get_json(auth_token, url_ship)
+    shipments = bc_get_json_list(url_ship)
 
-    if isinstance(shipments, list):
-        for sh in shipments:
-            tn = (sh.get("tracking_number", "") or "").strip()
-            # IMPORTANT: keep even weird values like "1" so we can alert on them.
-            if tn != "":
-                tracking_numbers.append(tn)
+    for sh in shipments:
+        if not isinstance(sh, dict):
+            continue
+        tn = (sh.get("tracking_number", "") or "").strip()
+        # keep even weird values like "1" so we can alert on them
+        if tn != "":
+            tracking_numbers.append(tn)
 
-            if not provider:
-                provider = (sh.get("shipping_provider", "") or "").strip()
+        if not provider:
+            provider = (sh.get("shipping_provider", "") or "").strip()
 
     if not tracking_numbers:
         url_addr = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
-        addrs = bc_get_json(auth_token, url_addr)
-        if isinstance(addrs, list):
-            for a in addrs:
-                tn = (a.get("tracking_number", "") or "").strip()
-                if tn != "":
-                    tracking_numbers.append(tn)
+        addrs = bc_get_json_list(url_addr)
+        for a in addrs:
+            if not isinstance(a, dict):
+                continue
+            tn = (a.get("tracking_number", "") or "").strip()
+            if tn != "":
+                tracking_numbers.append(tn)
 
-    # Dedup (after normalization of whitespace)
+    # Dedup (after stripping)
     deduped: List[str] = []
     seen = set()
     for tn in tracking_numbers:
@@ -313,9 +390,9 @@ def fetch_tracking_numbers_and_provider(auth_token: str, store_id: str, order_id
     return deduped, provider
 
 
-def update_order_status(auth_token: str, store_id: str, order_id: int, new_status_id: int) -> None:
+def update_order_status(store_id: str, order_id: int, new_status_id: int) -> None:
     url = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}"
-    bc_put_json(auth_token, url, {"status_id": new_status_id})
+    bc_put_json(url, {"status_id": new_status_id})
 
 
 # ----------------------------
@@ -450,10 +527,10 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    # Required BC envs
-    store_id = _get_env("BC_STORE_ID", required=True).strip()
-    bc_auth_token = _get_env("BC_AUTH_TOKEN", required=True).strip()
+    # Force env presence early (so failures are obvious)
+    _ = _get_env("BC_AUTH_TOKEN", required=True)
 
+    store_id = _get_env("BC_STORE_ID", required=True)
     shipped_status_id = 2
     completed_status_id = 10
 
@@ -483,12 +560,12 @@ def main() -> int:
     cached_orders: Dict[str, Any] = state["orders"]
 
     logging.info("Fetching BigCommerce orders in status_id=2 (Shipped)...")
-    orders = list_orders_by_status(bc_auth_token, store_id, shipped_status_id, limit=250)
+    orders = list_orders_by_status(store_id, shipped_status_id, limit=250)
     shipped_ids = [int(o.get("id")) for o in orders if isinstance(o, dict) and o.get("id") is not None]
     shipped_ids_set = set(shipped_ids)
     logging.info(f"Found {len(shipped_ids)} shipped orders.")
 
-    # prune cache (removes itself once order leaves Shipped)
+    # prune cache
     for oid_str in list(cached_orders.keys()):
         try:
             oid = int(oid_str)
@@ -507,14 +584,14 @@ def main() -> int:
         if oid_key in cached_orders:
             continue
 
-        shipping_method = fetch_shipping_method(bc_auth_token, store_id, oid)
-        tracking_numbers, provider = fetch_tracking_numbers_and_provider(bc_auth_token, store_id, oid)
+        shipping_method = fetch_shipping_method(store_id, oid)
+        tracking_numbers, provider = fetch_tracking_numbers_and_provider(store_id, oid)
 
         cached_orders[oid_key] = {
             "order_id": oid,
             "shipping_method": shipping_method,
             "ship_by_weight": is_ship_by_weight(shipping_method),
-            "tracking_numbers": tracking_numbers,   # may include weird values like "1"
+            "tracking_numbers": tracking_numbers,
             "shipping_provider": provider,
             "last_fedex_check_utc": None,
             "tracking_status": {},
@@ -561,7 +638,6 @@ def main() -> int:
                     "notes": "Obvious invalid tracking format (will block completion).",
                 })
 
-    # Write missing tracking alert
     if missing_tracking_rows:
         logging.warning(f"ALERT: {len(missing_tracking_rows)} Ship By Weight shipped orders have no tracking number.")
         write_alert_markdown(
@@ -576,7 +652,6 @@ def main() -> int:
         _write_step_output("missing_tracking", "false")
         _write_step_output("missing_tracking_count", "0")
 
-    # Write invalid tracking alert
     if invalid_tracking_rows:
         logging.warning(f"ALERT: {len(invalid_tracking_rows)} invalid tracking number(s) detected on Ship By Weight orders.")
         write_alert_markdown(
@@ -591,7 +666,6 @@ def main() -> int:
         _write_step_output("invalid_tracking", "false")
         _write_step_output("invalid_tracking_count", "0")
 
-    # Default for fedex_empty outputs
     _write_step_output("fedex_empty", "false")
     _write_step_output("fedex_empty_count", "0")
 
@@ -610,7 +684,7 @@ def main() -> int:
                 logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
             else:
                 try:
-                    update_order_status(bc_auth_token, store_id, oid, completed_status_id)
+                    update_order_status(store_id, oid, completed_status_id)
                     logging.info(f"Set order {oid} -> Completed.")
                 except Exception as e:
                     logging.error(f"Failed to set order {oid} -> Completed: {e}")
@@ -685,7 +759,6 @@ def main() -> int:
 
             output = resp.get("output", {})
             complete = output.get("completeTrackResults") or []
-
             if not isinstance(complete, list) or not complete:
                 fedex_empty_batches += 1
                 logging.warning("FedEx response had no completeTrackResults; skipping this batch.")
@@ -815,7 +888,7 @@ def main() -> int:
                     logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
                 else:
                     try:
-                        update_order_status(bc_auth_token, store_id, oid, completed_status_id)
+                        update_order_status(store_id, oid, completed_status_id)
                         logging.info(f"Set order {oid} -> Completed.")
                     except Exception as e:
                         logging.error(f"Failed to set order {oid} -> Completed: {e}")
