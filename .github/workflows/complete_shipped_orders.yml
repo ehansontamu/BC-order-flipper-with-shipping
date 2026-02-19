@@ -64,7 +64,7 @@ jobs:
           
           
           
-            - name: Debug alert outputs / files
+      - name: Debug alert outputs / files
         if: always()
         run: |
           echo "missing_tracking=${{ steps.run.outputs.missing_tracking }}"
