@@ -61,6 +61,31 @@ jobs:
           LOG_LEVEL: INFO
         run: |
           python scripts/complete_shipped_orders.py
+          
+          
+          
+            - name: Debug alert outputs / files
+        if: always()
+        run: |
+          echo "missing_tracking=${{ steps.run.outputs.missing_tracking }}"
+          echo "missing_tracking_count=${{ steps.run.outputs.missing_tracking_count }}"
+          echo "fedex_empty=${{ steps.run.outputs.fedex_empty }}"
+          echo "fedex_empty_count=${{ steps.run.outputs.fedex_empty_count }}"
+          echo "invalid_tracking=${{ steps.run.outputs.invalid_tracking }}"
+          echo "invalid_tracking_count=${{ steps.run.outputs.invalid_tracking_count }}"
+          echo ""
+          echo "---- .cache listing ----"
+          ls -la .cache || true
+          echo ""
+          echo "---- missing_tracking.md ----"
+          sed -n '1,200p' .cache/missing_tracking.md || true
+          echo ""
+          echo "---- fedex_empty.md ----"
+          sed -n '1,200p' .cache/fedex_empty.md || true
+          echo ""
+          echo "---- invalid_tracking.md ----"
+          sed -n '1,200p' .cache/invalid_tracking.md || true
+
 
       - name: Create / update GitHub Issue if Ship By Weight missing tracking
         if: steps.run.outputs.missing_tracking == 'true'
