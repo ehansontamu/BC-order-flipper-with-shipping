@@ -314,8 +314,8 @@ def write_alert_markdown(alert_path: str, missing: List[Dict[str, Any]]) -> None
     lines.append("|---:|---|---|")
     for m in missing:
         oid = m.get("order_id")
-        sm = (m.get("shipping_method") or "").replace("|", "\|")
-        notes = (m.get("notes") or "").replace("|", "\|")
+        sm = (m.get("shipping_method") or "").replace("|", "\\|")
+        notes = (m.get("notes") or "").replace("|", "\\|")
         lines.append(f"| {oid} | {sm} | {notes} |")
     lines.append("")
     lines.append("Action: Add tracking number to the shipment in BigCommerce (or adjust automation rules if this is expected).")
