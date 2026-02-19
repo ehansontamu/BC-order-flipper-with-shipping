@@ -7,26 +7,29 @@ complete_shipped_orders.py
 Rules (status_id=2 only):
 1) If shipping method is NOT "Ship By Weight" => move to status_id=10 (Completed) immediately.
 2) If shipping method IS "Ship By Weight":
-   - Read ALL BigCommerce shipments (multiple shipments supported).
-   - If ANY shipment is missing a tracking number => ALERT and DO NOT complete.
-   - Use FedEx Track API to check ALL tracking numbers.
-   - If ANY tracking number is invalid/untrackable => ALERT and DO NOT complete.
-   - Only complete the BigCommerce order when ALL tracking numbers are delivered.
+   - Pull all tracking numbers from the order (multiple shipments supported).
+   - If there are NO tracking numbers: ALERT (but do NOT fail the run).
+   - If ANY tracking numbers are obviously invalid (e.g., "1"): ALERT (but do NOT fail the run).
+   - Use FedEx Track API to check ALL tracking numbers (for trackable ones).
+   - Only move the BigCommerce order to Completed when:
+       * there are NO missing tracking numbers,
+       * there are NO invalid tracking numbers,
+       * and ALL tracking numbers are delivered.
 
-Alerting (non-fatal):
-- missing tracking => missing_tracking.md
-- invalid tracking => invalid_tracking.md
-- FedEx empty response batches => fedex_empty.md
+Alerting:
+- Missing tracking: write markdown (ALERT_PATH) + set step output missing_tracking=true
+- Invalid tracking: write markdown (INVALID_TRACKING_ALERT_PATH) + set step output invalid_tracking=true
+- FedEx empty/unparseable results (optional): write markdown (FEDEX_EMPTY_ALERT_PATH) + output fedex_empty=true
 
 Caching:
-- Each run lists shipped orders (status 2).
-- Shipping method + shipment/tracking metadata are fetched once per order then cached.
-- Cache is pruned when an order is no longer in status 2.
+- Each run lists shipped orders.
+- Shipping method + tracking numbers are fetched once per order then cached.
+- Cache prunes itself when an order is no longer in Shipped status.
 
-GitHub Actions step outputs:
-- missing_tracking (true/false), missing_tracking_count
-- invalid_tracking (true/false), invalid_tracking_count
-- fedex_empty (true/false), fedex_empty_count
+Notes:
+- Tracking format validation is heuristic. FedEx tracking numbers are commonly 12 or 15 digits, sometimes 20 or 22.
+  This script flags obviously-bad values (too short, illegal characters), and still allows “unknown-but-plausible”
+  values through to the FedEx API.
 """
 
 from __future__ import annotations
@@ -74,6 +77,24 @@ def _safe_mkdir_for_file(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
+def retry_request(func, retries: int = 8, delay: float = 2.0, backoff: float = 1.5):
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func()
+        except requests.RequestException as e:
+            last_err = e
+            logging.warning(f"Request failed (attempt {attempt}/{retries}): {e}")
+            time.sleep(delay)
+            delay *= backoff
+    raise RuntimeError(f"Max retries reached for an API call. Last error: {last_err}")
+
+
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
 def _write_step_output(key: str, value: str) -> None:
     """
     Write to GitHub Actions step outputs if GITHUB_OUTPUT is available.
@@ -89,24 +110,6 @@ def _write_step_output(key: str, value: str) -> None:
         pass
 
 
-def retry_request(func, retries: int = 8, delay: float = 2.0, backoff: float = 1.5):
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            return func()
-        except requests.RequestException as e:
-            last_err = e
-            logging.warning(f"Request failed (attempt {attempt}/{retries}): {e}")
-            time.sleep(delay)
-            delay *= backoff
-    raise RuntimeError(f"Max retries reached for an API call. Last error: {last_err}")
-
-
-def chunks(lst: List[str], n: int):
-    for i in range(0, len(lst), n):
-        yield lst[i : i + n]
-
-
 def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -114,6 +117,55 @@ def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def normalize(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
+# ----------------------------
+# Tracking validation (heuristic)
+# ----------------------------
+_ALLOWED_TRACKING_CHARS = re.compile(r"^[A-Za-z0-9]+$")  # after stripping spaces/hyphens
+_DIGITS_ONLY = re.compile(r"^[0-9]+$")
+
+
+def classify_tracking_number(raw: str) -> Tuple[bool, str]:
+    """
+    Returns (is_obviously_invalid, reason).
+    - Flags obviously bad values so they trigger alerts even if FedEx returns empty output.
+    - Allows unknown-but-plausible values to still go to FedEx.
+    """
+    if raw is None:
+        return True, "missing"
+
+    t = str(raw).strip()
+    if not t:
+        return True, "missing"
+
+    # remove common separators
+    compact = t.replace(" ", "").replace("-", "")
+    if not compact:
+        return True, "missing"
+
+    # illegal characters?
+    if not _ALLOWED_TRACKING_CHARS.match(compact):
+        return True, "illegal_characters"
+
+    # too short to be a real carrier tracking number (catches "1", "123", etc.)
+    if len(compact) < 8:
+        return True, "too_short"
+
+    # FedEx is commonly digits-only; if it's digits-only but extremely short/odd, we already caught via len.
+    # If it's digits-only, we can "bless" common FedEx lengths (but do not mark other lengths invalid).
+    if _DIGITS_ONLY.match(compact):
+        if len(compact) in {12, 15, 20, 22}:
+            return False, "looks_like_fedex_common_length"
+        # digits-only but not a common length: still not "obviously invalid", let FedEx decide.
+        return False, "digits_unknown_length"
+
+    # alphanumeric (door tag / ref / etc) - not obviously invalid
+    return False, "alphanumeric_unknown_format"
 
 
 # ----------------------------
@@ -127,37 +179,28 @@ def bc_headers() -> Dict[str, str]:
     }
 
 
-def _safe_json(resp: requests.Response, context: str) -> Any:
-    """
-    BigCommerce sometimes returns empty/non-JSON bodies (esp. on errors or edge cases).
-    This prevents JSONDecodeError crashes and gives you useful logs.
-    """
-    text = resp.text or ""
-    if resp.status_code >= 400:
-        raise requests.HTTPError(
-            f"{context} failed {resp.status_code}: {text[:500]}",
-            response=resp,
-        )
-
-    # For safety, allow empty JSON-ish responses
-    if text.strip() == "":
-        # Treat as empty object rather than crashing
-        logging.warning(f"{context}: empty response body (treated as empty JSON).")
-        return {}
-
-    try:
-        return resp.json()
-    except Exception:
-        logging.error(f"{context}: response was not valid JSON. First 500 chars: {text[:500]}")
-        raise
-
-
 def bc_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Any:
     def _do():
         return requests.get(url, headers=bc_headers(), params=params, timeout=timeout)
 
     resp = retry_request(_do)
-    return _safe_json(resp, f"BigCommerce GET {url}")
+
+    # If BC returns HTML/empty for some reason, fail with useful info
+    if resp.status_code >= 400:
+        raise requests.HTTPError(f"BigCommerce GET failed {resp.status_code} {url}: {resp.text[:500]}", response=resp)
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" not in ctype:
+        # BC sometimes still returns JSON with weird header, so try json() first, then fall back
+        try:
+            return resp.json()
+        except Exception:
+            raise RuntimeError(
+                f"BigCommerce GET returned non-JSON Content-Type={ctype} for {url}. "
+                f"First 500 bytes: {resp.text[:500]!r}"
+            )
+
+    return resp.json()
 
 
 def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
@@ -165,7 +208,13 @@ def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
         return requests.put(url, headers=bc_headers(), json=payload, timeout=timeout)
 
     resp = retry_request(_do)
-    return _safe_json(resp, f"BigCommerce PUT {url}")
+    if resp.status_code >= 400:
+        raise requests.HTTPError(f"BigCommerce PUT failed {resp.status_code} {url}: {resp.text[:500]}", response=resp)
+
+    try:
+        return resp.json()
+    except Exception:
+        return {"status_code": resp.status_code, "text": resp.text}
 
 
 def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
@@ -176,8 +225,7 @@ def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> Li
         url = f"{BC_BASE_URL}/{store_id}/v2/orders"
         batch = bc_get_json(url, params={"status_id": status_id, "page": page, "limit": limit})
         if not isinstance(batch, list):
-            # Some BC errors return dicts; let’s show it
-            raise RuntimeError(f"Unexpected BigCommerce orders response (expected list). Got: {type(batch)} -> {batch}")
+            raise RuntimeError(f"Unexpected BigCommerce orders response (expected list). Got: {type(batch)}")
         if not batch:
             break
         orders.extend(batch)
@@ -196,79 +244,46 @@ def fetch_shipping_method(store_id: str, order_id: int) -> str:
     return ""
 
 
-@dataclass
-class ShipmentInfo:
-    shipment_id: Optional[int]
-    tracking_number: str
-    shipping_provider: str
-
-
-def fetch_shipments_and_tracking(store_id: str, order_id: int) -> Tuple[List[str], str, int, int, List[ShipmentInfo]]:
+def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[List[str], str]:
     """
-    Returns:
-      tracking_numbers (deduped, non-empty)
-      provider (first non-empty provider observed)
-      shipment_count (how many shipment records exist)
-      missing_tracking_count (shipment records with empty tracking_number)
-      shipments_detail (for better alert logging/troubleshooting)
+    Pull tracking numbers from shipments endpoint; if empty, fall back to shipping_addresses.
+    Dedupes and preserves order.
     """
     tracking_numbers: List[str] = []
     provider = ""
-    shipment_count = 0
-    missing_tracking_count = 0
-    shipments_detail: List[ShipmentInfo] = []
 
     url_ship = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipments"
     shipments = bc_get_json(url_ship)
 
     if isinstance(shipments, list):
-        shipment_count = len(shipments)
         for sh in shipments:
-            tn_raw = (sh.get("tracking_number", "") or "").strip()
-            prov = (sh.get("shipping_provider", "") or "").strip()
-            sid = sh.get("id")
-            if sid is not None:
-                try:
-                    sid = int(sid)
-                except Exception:
-                    sid = None
+            tn = (sh.get("tracking_number", "") or "").strip()
+            # IMPORTANT: keep even weird values like "1" so we can alert on them.
+            if tn != "":
+                tracking_numbers.append(tn)
 
-            shipments_detail.append(
-                ShipmentInfo(
-                    shipment_id=sid,
-                    tracking_number=tn_raw,
-                    shipping_provider=prov,
-                )
-            )
+            if not provider:
+                provider = (sh.get("shipping_provider", "") or "").strip()
 
-            if tn_raw:
-                tracking_numbers.append(tn_raw)
-            else:
-                missing_tracking_count += 1
-
-            if not provider and prov:
-                provider = prov
-
-    # Fallback only if there are NO shipment records at all
-    if shipment_count == 0:
+    if not tracking_numbers:
         url_addr = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
         addrs = bc_get_json(url_addr)
         if isinstance(addrs, list):
             for a in addrs:
                 tn = (a.get("tracking_number", "") or "").strip()
-                if tn:
+                if tn != "":
                     tracking_numbers.append(tn)
 
-    # Dedupe
+    # Dedup (after normalization of whitespace)
     deduped: List[str] = []
     seen = set()
     for tn in tracking_numbers:
-        tn2 = tn.strip()
-        if tn2 and tn2 not in seen:
+        tn2 = str(tn).strip()
+        if tn2 not in seen:
             seen.add(tn2)
             deduped.append(tn2)
 
-    return deduped, provider, shipment_count, missing_tracking_count, shipments_detail
+    return deduped, provider
 
 
 def update_order_status(store_id: str, order_id: int, new_status_id: int) -> None:
@@ -319,17 +334,17 @@ class FedExTrackSummary:
     delivered_at_utc: Optional[str]
 
 
-def fedex_summarize_one(track_result: Dict[str, Any], fallback_tracking_number: str) -> FedExTrackSummary:
+def fedex_summarize_one(tr: Dict[str, Any], fallback_tracking_number: str) -> FedExTrackSummary:
     tn = fallback_tracking_number
-    tni = track_result.get("trackingNumberInfo") or {}
+    tni = (tr.get("trackingNumberInfo") or {})
     if isinstance(tni, dict) and tni.get("trackingNumber"):
         tn = str(tni["trackingNumber"])
 
-    latest = track_result.get("latestStatusDetail") or {}
+    latest = tr.get("latestStatusDetail") or {}
     latest_status = latest.get("description") or latest.get("statusByLocale") or latest.get("code") or "Unknown"
 
     delivered_at: Optional[datetime] = None
-    for item in (track_result.get("dateAndTimes") or []):
+    for item in (tr.get("dateAndTimes") or []):
         if isinstance(item, dict) and item.get("type") == "ACTUAL_DELIVERY":
             dt = _parse_dt(item.get("dateTime"))
             if dt:
@@ -345,17 +360,9 @@ def fedex_is_delivered(summary: FedExTrackSummary) -> bool:
     return "delivered" in summary.latest_status.lower()
 
 
-def normalize_tracking(tn: str) -> str:
-    return re.sub(r"\s+", "", (tn or "").strip())
-
-
 # ----------------------------
 # Shipping-method rules
 # ----------------------------
-def normalize(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
-
-
 def is_ship_by_weight(shipping_method: str) -> bool:
     sm = normalize(shipping_method)
     return sm == "ship by weight" or "ship by weight" in sm
@@ -379,27 +386,30 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def write_markdown_table(alert_path: str, title: str, intro: str, rows: List[Dict[str, str]], columns: List[Tuple[str, str]]) -> None:
-    """
-    columns: list of (col_title, key_in_row_dict)
-    """
+def _md_escape_pipes(s: str) -> str:
+    return (s or "").replace("|", "\\|")  # avoids python invalid escape warnings
+
+
+def write_alert_markdown(alert_path: str, title: str, intro: str, rows: List[Dict[str, Any]]) -> None:
     _safe_mkdir_for_file(alert_path)
     lines: List[str] = []
     lines.append(f"### {title}")
     lines.append("")
     lines.append(intro)
     lines.append("")
-    # header
-    lines.append("| " + " | ".join([c[0] for c in columns]) + " |")
-    lines.append("|" + "|".join(["---" for _ in columns]) + "|")
-    # rows
-    for r in rows:
-        vals = []
-        for _, key in columns:
-            v = (r.get(key, "") or "").replace("|", "\\|")
-            vals.append(v)
-        lines.append("| " + " | ".join(vals) + " |")
-    lines.append("")
+    if rows:
+        # Expect rows with: order_id, shipping_method, tracking_number(optional), reason(optional), notes(optional)
+        headers = ["Order ID", "Shipping Method", "Tracking #", "Reason", "Notes"]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|---:|---|---|---|---|")
+        for r in rows:
+            oid = r.get("order_id", "")
+            sm = _md_escape_pipes(str(r.get("shipping_method", "")))
+            tn = _md_escape_pipes(str(r.get("tracking_number", "")))
+            reason = _md_escape_pipes(str(r.get("reason", "")))
+            notes = _md_escape_pipes(str(r.get("notes", "")))
+            lines.append(f"| {oid} | {sm} | {tn} | {reason} | {notes} |")
+        lines.append("")
     with open(alert_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -409,7 +419,10 @@ def write_markdown_table(alert_path: str, title: str, intro: str, rows: List[Dic
 # ----------------------------
 def main() -> int:
     log_level = _get_env("LOG_LEVEL", default="INFO").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
 
     store_id = _get_env("BC_STORE_ID", required=True)
     shipped_status_id = 2
@@ -422,9 +435,11 @@ def main() -> int:
         raise RuntimeError("FEDEX_ENV must be 'prod' or 'sandbox'")
 
     state_path = _get_env("STATE_PATH", default=".cache/shipped_state.json")
-    missing_tracking_alert_path = _get_env("ALERT_PATH", default=".cache/missing_tracking.md")
-    fedex_empty_alert_path = _get_env("FEDEX_EMPTY_ALERT_PATH", default=".cache/fedex_empty.md")
-    invalid_tracking_alert_path = _get_env("INVALID_TRACKING_ALERT_PATH", default=".cache/invalid_tracking.md")
+
+    # Alerts
+    missing_tracking_path = _get_env("ALERT_PATH", default=".cache/missing_tracking.md")
+    invalid_tracking_path = _get_env("INVALID_TRACKING_ALERT_PATH", default=".cache/invalid_tracking.md")
+    fedex_empty_path = _get_env("FEDEX_EMPTY_ALERT_PATH", default=".cache/fedex_empty.md")
 
     min_fedex_interval = int(_get_env("MIN_FEDEX_CHECK_INTERVAL_SEC", default="600"))
     max_orders = int(_get_env("MAX_ORDERS_PER_RUN", default="0"))
@@ -432,14 +447,6 @@ def main() -> int:
 
     base_url = FEDEX_BASE_URLS[fedex_env]
     now = _utc_now()
-
-    # Default step outputs
-    _write_step_output("missing_tracking", "false")
-    _write_step_output("missing_tracking_count", "0")
-    _write_step_output("invalid_tracking", "false")
-    _write_step_output("invalid_tracking_count", "0")
-    _write_step_output("fedex_empty", "false")
-    _write_step_output("fedex_empty_count", "0")
 
     state = load_state(state_path)
     if "orders" not in state or not isinstance(state["orders"], dict):
@@ -452,7 +459,7 @@ def main() -> int:
     shipped_ids_set = set(shipped_ids)
     logging.info(f"Found {len(shipped_ids)} shipped orders.")
 
-    # prune cache for orders no longer in shipped status
+    # prune cache (removes itself once order leaves Shipped)
     for oid_str in list(cached_orders.keys()):
         try:
             oid = int(oid_str)
@@ -472,67 +479,98 @@ def main() -> int:
             continue
 
         shipping_method = fetch_shipping_method(store_id, oid)
-        tracking_numbers, provider, shipment_count, missing_tracking_count, shipments_detail = fetch_shipments_and_tracking(store_id, oid)
+        tracking_numbers, provider = fetch_tracking_numbers_and_provider(store_id, oid)
 
         cached_orders[oid_key] = {
             "order_id": oid,
             "shipping_method": shipping_method,
             "ship_by_weight": is_ship_by_weight(shipping_method),
-
-            "tracking_numbers": tracking_numbers,  # deduped non-empty
+            "tracking_numbers": tracking_numbers,   # may include weird values like "1"
             "shipping_provider": provider,
-
-            # critical for multi-shipment correctness
-            "shipment_count": shipment_count,
-            "missing_tracking_count": missing_tracking_count,
-            "shipments_detail": [
-                {
-                    "shipment_id": s.shipment_id,
-                    "tracking_number": s.tracking_number,
-                    "shipping_provider": s.shipping_provider,
-                }
-                for s in shipments_detail
-            ],
-
             "last_fedex_check_utc": None,
             "tracking_status": {},
             "tracking_delivered": {},
-            "invalid_tracking_numbers": [],
         }
         hydrated += 1
+
     if hydrated:
         logging.info(f"Hydrated {hydrated} new shipped orders into cache.")
 
-    # ----------------------------------------
-    # ALERT: Ship By Weight + missing tracking in ANY shipment
-    # ----------------------------------------
-    missing_tracking_orders: List[Dict[str, str]] = []
-    for _, info in cached_orders.items():
-        if info.get("ship_by_weight") is True:
-            if int(info.get("missing_tracking_count") or 0) > 0:
-                missing_tracking_orders.append(
-                    {
-                        "order_id": str(info.get("order_id")),
-                        "shipping_method": str(info.get("shipping_method") or ""),
-                        "notes": f"{info.get('missing_tracking_count')} shipment(s) missing tracking out of {info.get('shipment_count')} shipment(s).",
-                    }
-                )
+    # ----------------------------
+    # Alert detection (missing + invalid)
+    # ----------------------------
+    missing_tracking_rows: List[Dict[str, Any]] = []
+    invalid_tracking_rows: List[Dict[str, Any]] = []
 
-    if missing_tracking_orders:
-        logging.warning(f"ALERT: {len(missing_tracking_orders)} Ship By Weight shipped orders have missing tracking numbers on at least one shipment.")
-        write_markdown_table(
-            missing_tracking_alert_path,
+    for _, info in cached_orders.items():
+        if info.get("ship_by_weight") is not True:
+            continue
+
+        tns = info.get("tracking_numbers") or []
+        oid = int(info.get("order_id"))
+        sm = info.get("shipping_method") or ""
+
+        # Missing: no usable tracking at all (or only blanks)
+        usable = [str(t).strip() for t in tns if str(t).strip() != ""]
+        if not usable:
+            missing_tracking_rows.append({
+                "order_id": oid,
+                "shipping_method": sm,
+                "tracking_number": "",
+                "reason": "missing",
+                "notes": "Ship By Weight but no tracking numbers found in /shipments or /shipping_addresses.",
+            })
+            continue
+
+        # Invalid: any obviously invalid tracking number should alert + block completion
+        for tn in usable:
+            is_bad, reason = classify_tracking_number(tn)
+            if is_bad:
+                invalid_tracking_rows.append({
+                    "order_id": oid,
+                    "shipping_method": sm,
+                    "tracking_number": tn,
+                    "reason": reason,
+                    "notes": "Obvious invalid tracking format (will block completion).",
+                })
+
+    # Write missing tracking alert
+    if missing_tracking_rows:
+        logging.warning(f"ALERT: {len(missing_tracking_rows)} Ship By Weight shipped orders have no tracking number.")
+        write_alert_markdown(
+            missing_tracking_path,
             title="Ship By Weight orders missing tracking number",
-            intro=f"Found **{len(missing_tracking_orders)}** shipped order(s) where shipping method is **Ship By Weight** but one or more shipments have no tracking number.",
-            rows=missing_tracking_orders,
-            columns=[("Order ID", "order_id"), ("Shipping Method", "shipping_method"), ("Notes", "notes")],
+            intro=f"Found **{len(missing_tracking_rows)}** shipped order(s) with shipping method **Ship By Weight** but no tracking number.",
+            rows=missing_tracking_rows,
         )
         _write_step_output("missing_tracking", "true")
-        _write_step_output("missing_tracking_count", str(len(missing_tracking_orders)))
+        _write_step_output("missing_tracking_count", str(len(missing_tracking_rows)))
+    else:
+        _write_step_output("missing_tracking", "false")
+        _write_step_output("missing_tracking_count", "0")
 
-    # ----------------------------------------
-    # 1) Complete anything that is NOT Ship By Weight immediately
-    # ----------------------------------------
+    # Write invalid tracking alert
+    if invalid_tracking_rows:
+        logging.warning(f"ALERT: {len(invalid_tracking_rows)} invalid tracking number(s) detected on Ship By Weight orders.")
+        write_alert_markdown(
+            invalid_tracking_path,
+            title="Ship By Weight orders with invalid tracking numbers",
+            intro=f"Found **{len(invalid_tracking_rows)}** invalid tracking number(s) on shipped orders with shipping method **Ship By Weight**.",
+            rows=invalid_tracking_rows,
+        )
+        _write_step_output("invalid_tracking", "true")
+        _write_step_output("invalid_tracking_count", str(len(invalid_tracking_rows)))
+    else:
+        _write_step_output("invalid_tracking", "false")
+        _write_step_output("invalid_tracking_count", "0")
+
+    # Default for fedex_empty outputs
+    _write_step_output("fedex_empty", "false")
+    _write_step_output("fedex_empty_count", "0")
+
+    # ----------------------------
+    # 1) Complete anything NOT Ship By Weight immediately
+    # ----------------------------
     to_complete_immediately: List[int] = []
     for _, info in list(cached_orders.items()):
         if info.get("ship_by_weight") is False:
@@ -552,29 +590,36 @@ def main() -> int:
                     continue
             cached_orders.pop(str(oid), None)
 
-    # ----------------------------------------
-    # 2) Ship By Weight => FedEx check ALL tns; complete only if ALL delivered
-    #    AND no missing shipment tracking AND no invalid tracking
-    # ----------------------------------------
-    # Build list of tracking numbers that need FedEx checking this run
+    # ----------------------------
+    # 2) Ship By Weight => FedEx check (but NEVER complete if missing/invalid exists)
+    # ----------------------------
+    # Build a set of orders that are blocked due to missing/invalid tracking.
+    blocked_order_ids = set()
+    for r in missing_tracking_rows:
+        blocked_order_ids.add(int(r["order_id"]))
+    for r in invalid_tracking_rows:
+        blocked_order_ids.add(int(r["order_id"]))
+
     tns_to_check: List[str] = []
+    tn_to_orders: Dict[str, List[int]] = {}
 
     for _, info in cached_orders.items():
         if info.get("ship_by_weight") is not True:
             continue
 
-        # If ANY shipment missing tracking, block completion (and do not waste FedEx calls)
-        if int(info.get("missing_tracking_count") or 0) > 0:
+        oid = int(info["order_id"])
+        if oid in blocked_order_ids:
+            # Missing or invalid tracking => do NOT FedEx-check for completion purposes
             continue
 
-        tns = info.get("tracking_numbers") or []
+        tns = [str(t).strip() for t in (info.get("tracking_numbers") or []) if str(t).strip() != ""]
         if not tns:
-            # If shipments existed, missing would have been >0, but keep safe:
-            continue
+            continue  # already handled as missing
 
+        # Only check FedEx for providers that are FedEx OR unspecified
         provider = str(info.get("shipping_provider") or "").strip().lower()
         if provider and "fedex" not in provider:
-            # Not FedEx (or unknown); do not attempt FedEx calls
+            # If you later want UPS/USPS checks, this is where you'd branch
             continue
 
         last_check = info.get("last_fedex_check_utc")
@@ -583,11 +628,16 @@ def main() -> int:
             continue
 
         for tn in tns:
-            tn_clean = normalize_tracking(str(tn))
-            if tn_clean:
-                tns_to_check.append(tn_clean)
+            # also skip anything that is now “obviously invalid” (defense in depth)
+            is_bad, _ = classify_tracking_number(tn)
+            if is_bad:
+                blocked_order_ids.add(oid)
+                continue
 
-    # Dedup
+            tns_to_check.append(tn)
+            tn_to_orders.setdefault(tn, []).append(oid)
+
+    # Unique list
     uniq_tns: List[str] = []
     seen = set()
     for tn in tns_to_check:
@@ -595,241 +645,172 @@ def main() -> int:
             seen.add(tn)
             uniq_tns.append(tn)
 
-    fedex_empty_batches: List[Dict[str, str]] = []
-    # Maps for results
-    tn_delivered: Dict[str, bool] = {}
-    tn_status: Dict[str, str] = {}
-    tn_invalid: Dict[str, str] = {}  # tracking -> reason
+    fedex_empty_batches = 0
 
     if uniq_tns:
         logging.info(f"FedEx checks needed this run (tracking #s): {len(uniq_tns)}")
         token = fedex_get_access_token(base_url, fedex_client_id, fedex_client_secret)
+
+        tn_delivered: Dict[str, bool] = {}
+        tn_status: Dict[str, str] = {}
+        tn_seen_in_response: set[str] = set()
 
         for batch in chunks(uniq_tns, 30):
             try:
                 resp = fedex_track_bulk(base_url, token, batch)
             except Exception as e:
                 logging.error(f"FedEx track call failed for batch {batch}: {e}")
-                # Mark these as unknown/invalid for this run, but don't permanently label them invalid.
-                for tn in batch:
-                    tn_invalid[tn] = f"FedEx request failed: {e}"
                 continue
 
             output = resp.get("output", {})
             complete = output.get("completeTrackResults") or []
 
             if not isinstance(complete, list) or not complete:
+                fedex_empty_batches += 1
                 logging.warning("FedEx response had no completeTrackResults; skipping this batch.")
-                fedex_empty_batches.append(
-                    {
-                        "batch": ", ".join(batch),
-                        "notes": "FedEx response had no completeTrackResults for this request.",
-                    }
-                )
-                # Treat all in this batch as invalid/untrackable for now (alerts) because they produced no usable results.
-                for tn in batch:
-                    tn_invalid[tn] = "FedEx response had no completeTrackResults"
                 continue
-
-            # Parse results & detect invalids:
-            # If a TN appears in our request but FedEx gives no trackResults for it, mark invalid.
-            returned_tns_in_this_batch = set()
 
             for ctr in complete:
                 tr_list = (ctr.get("trackResults") or [])
                 if not tr_list:
-                    # There is a completeTrackResult but no trackResults — likely invalid.
-                    # We don’t know which TN this was (FedEx sometimes includes info elsewhere),
-                    # so we’ll skip marking here and rely on coverage check below.
                     continue
-
                 tr0 = tr_list[0]
-                # pull TN
+
                 tn_guess = ""
                 tni = (tr0.get("trackingNumberInfo") or {})
                 if isinstance(tni, dict):
                     tn_guess = str(tni.get("trackingNumber") or "").strip()
-                tn_guess = normalize_tracking(tn_guess)
-
-                # If FedEx didn't echo back the tracking number, we can't map it safely
                 if not tn_guess:
-                    continue
-
-                returned_tns_in_this_batch.add(tn_guess)
-
-                # Some FedEx responses include error notifications on trackResults
-                # If there is a severe notification, treat as invalid.
-                notifications = tr0.get("notifications") or []
-                severe = None
-                if isinstance(notifications, list):
-                    for n in notifications:
-                        if isinstance(n, dict):
-                            sev = str(n.get("severity") or "").upper()
-                            msg = str(n.get("message") or "")
-                            code = str(n.get("code") or "")
-                            if sev in {"ERROR", "FAILURE"}:
-                                severe = f"{sev} {code} {msg}".strip()
-                                break
-                if severe:
-                    tn_invalid[tn_guess] = severe
-                    tn_status[tn_guess] = "Invalid/Untrackable"
-                    tn_delivered[tn_guess] = False
                     continue
 
                 summary = fedex_summarize_one(tr0, tn_guess)
                 delivered = fedex_is_delivered(summary)
 
+                tn_seen_in_response.add(summary.tracking_number)
                 tn_delivered[summary.tracking_number] = delivered
                 tn_status[summary.tracking_number] = summary.latest_status
 
-            # Coverage check: any tracking in batch not returned by FedEx is invalid/untrackable
-            for requested_tn in batch:
-                req_norm = normalize_tracking(requested_tn)
-                if req_norm and req_norm not in returned_tns_in_this_batch and req_norm not in tn_invalid:
-                    tn_invalid[req_norm] = "No FedEx result returned for this tracking number"
+        # If FedEx didn't recognize some tracking numbers at all, treat them as invalid and alert + block completion.
+        fedex_unrecognized_rows: List[Dict[str, Any]] = []
+        for tn in uniq_tns:
+            tn_norm = tn.strip()
+            tn_alt = tn_norm.replace(" ", "").replace("-", "")
+            if tn_norm in tn_seen_in_response or tn_alt in tn_seen_in_response:
+                continue
 
-    # ----------------------------------------
-    # Apply FedEx results to cached orders & decide completion
-    # ----------------------------------------
-    invalid_tracking_orders: List[Dict[str, str]] = []
+            # Mark as invalid (unrecognized by FedEx)
+            for oid in tn_to_orders.get(tn, []):
+                # avoid duplicates in the issue
+                fedex_unrecognized_rows.append({
+                    "order_id": oid,
+                    "shipping_method": cached_orders.get(str(oid), {}).get("shipping_method", ""),
+                    "tracking_number": tn,
+                    "reason": "unrecognized_by_fedex",
+                    "notes": "FedEx API did not return any trackResults for this tracking number.",
+                })
+                blocked_order_ids.add(oid)
 
-    if uniq_tns:
+        if fedex_unrecognized_rows:
+            # Merge into invalid alert file + outputs (append behavior by rewriting full combined list)
+            combined = invalid_tracking_rows + fedex_unrecognized_rows
+            # de-dupe combined by (order_id, tracking_number, reason)
+            dedup = []
+            seen_keys = set()
+            for r in combined:
+                k = (int(r.get("order_id", 0)), str(r.get("tracking_number", "")), str(r.get("reason", "")))
+                if k in seen_keys:
+                    continue
+                seen_keys.add(k)
+                dedup.append(r)
+
+            logging.warning(f"ALERT: {len(fedex_unrecognized_rows)} tracking number(s) were unrecognized by FedEx.")
+            write_alert_markdown(
+                invalid_tracking_path,
+                title="Ship By Weight orders with invalid tracking numbers",
+                intro=f"Found **{len(dedup)}** invalid/unrecognized tracking number(s) on shipped orders with shipping method **Ship By Weight**.",
+                rows=dedup,
+            )
+            _write_step_output("invalid_tracking", "true")
+            _write_step_output("invalid_tracking_count", str(len(dedup)))
+
+        # Optional: FedEx empty batches alert file
+        if fedex_empty_batches > 0:
+            write_alert_markdown(
+                fedex_empty_path,
+                title="FedEx API returned empty tracking results for one or more batches",
+                intro=f"FedEx returned empty `completeTrackResults` for **{fedex_empty_batches}** batch(es). This can be transient or indicate bad tracking input.",
+                rows=[],
+            )
+            _write_step_output("fedex_empty", "true")
+            _write_step_output("fedex_empty_count", str(fedex_empty_batches))
+
+        # Determine which orders can be completed
+        to_complete_after_fedex: List[int] = []
+
         for _, info in cached_orders.items():
             if info.get("ship_by_weight") is not True:
                 continue
 
-            # Block: missing tracking in any shipment
-            if int(info.get("missing_tracking_count") or 0) > 0:
+            oid = int(info["order_id"])
+            if oid in blocked_order_ids:
+                # Critical: ANY missing/invalid/unrecognized tracking blocks completion
                 continue
 
-            tns = info.get("tracking_numbers") or []
+            tns = [str(t).strip() for t in (info.get("tracking_numbers") or []) if str(t).strip() != ""]
             if not tns:
-                continue
-
-            provider = str(info.get("shipping_provider") or "").strip().lower()
-            if provider and "fedex" not in provider:
                 continue
 
             info["last_fedex_check_utc"] = now.isoformat()
             tracking_delivered = info.get("tracking_delivered") or {}
             tracking_status = info.get("tracking_status") or {}
-            invalid_list = set(info.get("invalid_tracking_numbers") or [])
 
-            # Update per tracking
             for tn in tns:
-                tn_norm = normalize_tracking(str(tn))
-                if not tn_norm:
+                tn_clean = tn.strip()
+                if not tn_clean:
                     continue
 
-                # Invalid?
-                if tn_norm in tn_invalid:
-                    invalid_list.add(tn_norm)
-                    tracking_delivered[tn_norm] = False
-                    tracking_status[tn_norm] = f"INVALID: {tn_invalid[tn_norm]}"
-                    continue
+                delivered = tn_delivered.get(tn_clean)
+                status = tn_status.get(tn_clean)
 
-                # Delivered/status?
-                if tn_norm in tn_delivered:
-                    tracking_delivered[tn_norm] = bool(tn_delivered[tn_norm])
-                if tn_norm in tn_status:
-                    tracking_status[tn_norm] = str(tn_status[tn_norm])
+                if delivered is None:
+                    tn_nospace = tn_clean.replace(" ", "").replace("-", "")
+                    delivered = tn_delivered.get(tn_nospace)
+                    status = status or tn_status.get(tn_nospace)
+
+                if delivered is not None:
+                    tracking_delivered[tn_clean] = bool(delivered)
+                if status is not None:
+                    tracking_status[tn_clean] = str(status)
 
             info["tracking_delivered"] = tracking_delivered
             info["tracking_status"] = tracking_status
-            info["invalid_tracking_numbers"] = sorted(invalid_list)
 
-            # If any invalid tracking exists, alert and block completion
-            if info["invalid_tracking_numbers"]:
-                invalid_tracking_orders.append(
-                    {
-                        "order_id": str(info.get("order_id")),
-                        "shipping_method": str(info.get("shipping_method") or ""),
-                        "tracking_numbers": ", ".join([normalize_tracking(t) for t in tns]),
-                        "notes": "Invalid/untrackable tracking detected: " + ", ".join(info["invalid_tracking_numbers"]),
-                    }
-                )
+            # Must have all delivered
+            all_delivered = True
+            for tn in tns:
+                if tracking_delivered.get(tn) is not True:
+                    all_delivered = False
+                    break
 
-    # Write invalid tracking alert (if any)
-    if invalid_tracking_orders:
-        logging.warning(f"ALERT: {len(invalid_tracking_orders)} Ship By Weight shipped orders have invalid tracking numbers.")
-        write_markdown_table(
-            invalid_tracking_alert_path,
-            title="Ship By Weight orders with invalid tracking numbers",
-            intro=f"Found **{len(invalid_tracking_orders)}** shipped order(s) with **Ship By Weight** where one or more tracking numbers appear invalid/untrackable via FedEx.",
-            rows=invalid_tracking_orders,
-            columns=[
-                ("Order ID", "order_id"),
-                ("Shipping Method", "shipping_method"),
-                ("Tracking Numbers", "tracking_numbers"),
-                ("Notes", "notes"),
-            ],
-        )
-        _write_step_output("invalid_tracking", "true")
-        _write_step_output("invalid_tracking_count", str(len(invalid_tracking_orders)))
+            if all_delivered:
+                to_complete_after_fedex.append(oid)
+                logging.info(f"All tracking numbers delivered => complete order {oid} (tns={tns})")
 
-    # Write FedEx empty response alert (if any)
-    if fedex_empty_batches:
-        logging.warning(f"ALERT: {len(fedex_empty_batches)} FedEx request batch(es) returned empty completeTrackResults.")
-        write_markdown_table(
-            fedex_empty_alert_path,
-            title="FedEx empty responses detected",
-            intro=f"Found **{len(fedex_empty_batches)}** FedEx request batch(es) where the API returned no `completeTrackResults`.",
-            rows=fedex_empty_batches,
-            columns=[("Batch", "batch"), ("Notes", "notes")],
-        )
-        _write_step_output("fedex_empty", "true")
-        _write_step_output("fedex_empty_count", str(len(fedex_empty_batches)))
+        if to_complete_after_fedex:
+            logging.info(f"Marking {len(to_complete_after_fedex)} Ship By Weight orders Completed (ALL tns delivered).")
+            for oid in to_complete_after_fedex:
+                if dry_run:
+                    logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
+                else:
+                    try:
+                        update_order_status(store_id, oid, completed_status_id)
+                        logging.info(f"Set order {oid} -> Completed.")
+                    except Exception as e:
+                        logging.error(f"Failed to set order {oid} -> Completed: {e}")
+                        continue
+                cached_orders.pop(str(oid), None)
 
-    # Completion decision for Ship By Weight orders:
-    to_complete_after_fedex: List[int] = []
-    for _, info in cached_orders.items():
-        if info.get("ship_by_weight") is not True:
-            continue
-
-        # Block completion if any shipment missing tracking
-        if int(info.get("missing_tracking_count") or 0) > 0:
-            continue
-
-        # Block completion if any invalid tracking numbers
-        if info.get("invalid_tracking_numbers"):
-            continue
-
-        tns = info.get("tracking_numbers") or []
-        if not tns:
-            continue
-
-        provider = str(info.get("shipping_provider") or "").strip().lower()
-        if provider and "fedex" not in provider:
-            continue
-
-        tracking_delivered = info.get("tracking_delivered") or {}
-        # Must have ALL delivered
-        all_delivered = True
-        for tn in tns:
-            tn_norm = normalize_tracking(str(tn))
-            if tn_norm and tracking_delivered.get(tn_norm) is not True:
-                all_delivered = False
-                break
-
-        if all_delivered:
-            to_complete_after_fedex.append(int(info["order_id"]))
-            logging.info(f"All tracking numbers delivered => complete order {info['order_id']} (tns={tns})")
-
-    if to_complete_after_fedex:
-        logging.info(f"Marking {len(to_complete_after_fedex)} Ship By Weight orders Completed (ALL tns delivered).")
-        for oid in to_complete_after_fedex:
-            if dry_run:
-                logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
-            else:
-                try:
-                    update_order_status(store_id, oid, completed_status_id)
-                    logging.info(f"Set order {oid} -> Completed.")
-                except Exception as e:
-                    logging.error(f"Failed to set order {oid} -> Completed: {e}")
-                    continue
-            cached_orders.pop(str(oid), None)
-
-    # Persist state
+    # Save state
     state["version"] = 4
     state["last_run_utc"] = now.isoformat()
     state["orders"] = cached_orders
