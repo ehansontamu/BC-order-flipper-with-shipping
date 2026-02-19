@@ -53,7 +53,6 @@ jobs:
           MAX_ORDERS_PER_RUN: "0"               # 0 = no cap
           DRY_RUN: "false"
           LOG_LEVEL: INFO
-
         run: |
           python scripts/complete_shipped_orders.py
 
@@ -85,11 +84,9 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: existing.number,
-                body: `New occurrence detected in run ${context.runId}:
-
-${body}`
+                body: `New occurrence detected in run ${context.runId}:\n\n${body}`
               });
-              // Ensure labels exist
+
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -101,9 +98,7 @@ ${body}`
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title,
-                body: `Detected in run ${context.runId}:
-
-${body}`,
+                body: `Detected in run ${context.runId}:\n\n${body}`,
                 labels
               });
             }
