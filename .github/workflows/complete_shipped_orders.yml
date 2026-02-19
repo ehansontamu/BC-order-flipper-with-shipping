@@ -5,11 +5,10 @@ on:
   # Later:
   # schedule:
   #   - cron: "*/15 * * * *"
-  
- concurrency:
+
+concurrency:
   group: flip-orders-in-shipped
   cancel-in-progress: false
-
 
 jobs:
   complete:
@@ -66,9 +65,7 @@ jobs:
           LOG_LEVEL: INFO
         run: |
           python scripts/complete_shipped_orders.py
-          
-          
-          
+
       - name: Debug alert outputs / files
         if: always()
         run: |
@@ -90,7 +87,6 @@ jobs:
           echo ""
           echo "---- invalid_tracking.md ----"
           sed -n '1,200p' .cache/invalid_tracking.md || true
-
 
       - name: Create / update GitHub Issue if Ship By Weight missing tracking
         if: steps.run.outputs.missing_tracking == 'true'
