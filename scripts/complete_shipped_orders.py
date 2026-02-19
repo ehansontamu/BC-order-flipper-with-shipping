@@ -179,28 +179,60 @@ def bc_headers() -> Dict[str, str]:
     }
 
 
-def bc_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Any:
-    def _do():
-        return requests.get(url, headers=bc_headers(), params=params, timeout=timeout)
+def bc_get_json(url: str, params: dict | None = None, *, timeout: int = 30, max_retries: int = 4):
+    headers = {
+        "X-Auth-Token": BC_AUTH_TOKEN,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-    resp = retry_request(_do)
+    backoff = 2.0
+    for attempt in range(1, max_retries + 1):
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
 
-    # If BC returns HTML/empty for some reason, fail with useful info
-    if resp.status_code >= 400:
-        raise requests.HTTPError(f"BigCommerce GET failed {resp.status_code} {url}: {resp.text[:500]}", response=resp)
+        status = resp.status_code
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        text = resp.text or ""
+        snippet = text[:500].replace("\n", " ").replace("\r", " ")
 
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    if "application/json" not in ctype:
-        # BC sometimes still returns JSON with weird header, so try json() first, then fall back
+        # Retryable statuses
+        if status in (429, 500, 502, 503, 504):
+            logging.warning(
+                "BigCommerce %s for %s (attempt %d/%d). Body snippet: %s",
+                status, url, attempt, max_retries, snippet
+            )
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        # Hard failures with clear messaging
+        if status in (401, 403):
+            raise RuntimeError(
+                f"BigCommerce auth error {status} calling {url}. "
+                f"Check BC_AUTH_TOKEN (and store scope). Body snippet: {snippet}"
+            )
+        if status == 404:
+            raise RuntimeError(
+                f"BigCommerce 404 calling {url}. "
+                f"Often means BC_STORE_ID is wrong/empty or endpoint path is wrong. Body snippet: {snippet}"
+            )
+
+        # Any other non-2xx
+        if not (200 <= status < 300):
+            raise RuntimeError(
+                f"BigCommerce HTTP {status} calling {url}. Body snippet: {snippet}"
+            )
+
+        # JSON decode with better diagnostics
         try:
             return resp.json()
         except Exception:
             raise RuntimeError(
-                f"BigCommerce GET returned non-JSON Content-Type={ctype} for {url}. "
-                f"First 500 bytes: {resp.text[:500]!r}"
+                f"BigCommerce returned non-JSON for {url} (HTTP {status}, Content-Type={ctype}). "
+                f"Body snippet: {snippet}"
             )
 
-    return resp.json()
+    raise RuntimeError(f"BigCommerce failed after {max_retries} retries for {url}.")
 
 
 def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:

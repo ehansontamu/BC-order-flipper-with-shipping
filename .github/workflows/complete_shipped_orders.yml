@@ -40,6 +40,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Sanity check required env (no values)
+        run: |
+          test -n "${BC_STORE_ID}" || (echo "BC_STORE_ID is EMPTY" && exit 1)
+          test -n "${BC_AUTH_TOKEN}" || (echo "BC_AUTH_TOKEN is EMPTY" && exit 1)
+          test -n "${FEDEX_CLIENT_ID}" || (echo "FEDEX_CLIENT_ID is EMPTY" && exit 1)
+          test -n "${FEDEX_CLIENT_SECRET}" || (echo "FEDEX_CLIENT_SECRET is EMPTY" && exit 1)
+        env:
+          BC_STORE_ID: ${{ secrets.BC_STORE_ID }}
+          BC_AUTH_TOKEN: ${{ secrets.BC_AUTH_TOKEN }}
+          FEDEX_CLIENT_ID: ${{ secrets.FEDEX_CLIENT_ID }}
+          FEDEX_CLIENT_SECRET: ${{ secrets.FEDEX_CLIENT_SECRET }}
+
       - name: Run completion logic
         id: run
         env:
