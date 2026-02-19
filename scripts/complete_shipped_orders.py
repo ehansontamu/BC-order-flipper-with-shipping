@@ -156,35 +156,30 @@ def classify_tracking_number(raw: str) -> Tuple[bool, str]:
     if len(compact) < 8:
         return True, "too_short"
 
-    # FedEx is commonly digits-only; if it's digits-only but extremely short/odd, we already caught via len.
-    # If it's digits-only, we can "bless" common FedEx lengths (but do not mark other lengths invalid).
     if _DIGITS_ONLY.match(compact):
         if len(compact) in {12, 15, 20, 22}:
             return False, "looks_like_fedex_common_length"
-        # digits-only but not a common length: still not "obviously invalid", let FedEx decide.
         return False, "digits_unknown_length"
 
-    # alphanumeric (door tag / ref / etc) - not obviously invalid
     return False, "alphanumeric_unknown_format"
 
 
 # ----------------------------
 # BigCommerce
 # ----------------------------
-def bc_headers() -> Dict[str, str]:
+def bc_headers(auth_token: str) -> Dict[str, str]:
     return {
-        "X-Auth-Token": _get_env("BC_AUTH_TOKEN", required=True),
+        "X-Auth-Token": auth_token,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
 
-def bc_get_json(url: str, params: dict | None = None, *, timeout: int = 30, max_retries: int = 4):
-    headers = {
-        "X-Auth-Token": BC_AUTH_TOKEN,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+def bc_get_json(auth_token: str, url: str, params: dict | None = None, *, timeout: int = 30, max_retries: int = 4):
+    """
+    GET JSON with retries and strong diagnostics.
+    """
+    headers = bc_headers(auth_token)
 
     backoff = 2.0
     for attempt in range(1, max_retries + 1):
@@ -235,9 +230,9 @@ def bc_get_json(url: str, params: dict | None = None, *, timeout: int = 30, max_
     raise RuntimeError(f"BigCommerce failed after {max_retries} retries for {url}.")
 
 
-def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
+def bc_put_json(auth_token: str, url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
     def _do():
-        return requests.put(url, headers=bc_headers(), json=payload, timeout=timeout)
+        return requests.put(url, headers=bc_headers(auth_token), json=payload, timeout=timeout)
 
     resp = retry_request(_do)
     if resp.status_code >= 400:
@@ -249,13 +244,13 @@ def bc_put_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Any:
         return {"status_code": resp.status_code, "text": resp.text}
 
 
-def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
+def list_orders_by_status(auth_token: str, store_id: str, status_id: int, limit: int = 250) -> List[Dict[str, Any]]:
     orders: List[Dict[str, Any]] = []
     page = 1
 
     while True:
         url = f"{BC_BASE_URL}/{store_id}/v2/orders"
-        batch = bc_get_json(url, params={"status_id": status_id, "page": page, "limit": limit})
+        batch = bc_get_json(auth_token, url, params={"status_id": status_id, "page": page, "limit": limit})
         if not isinstance(batch, list):
             raise RuntimeError(f"Unexpected BigCommerce orders response (expected list). Got: {type(batch)}")
         if not batch:
@@ -268,15 +263,15 @@ def list_orders_by_status(store_id: str, status_id: int, limit: int = 250) -> Li
     return orders
 
 
-def fetch_shipping_method(store_id: str, order_id: int) -> str:
+def fetch_shipping_method(auth_token: str, store_id: str, order_id: int) -> str:
     url = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
-    addrs = bc_get_json(url)
+    addrs = bc_get_json(auth_token, url)
     if isinstance(addrs, list) and addrs:
         return (addrs[0].get("shipping_method", "") or "").strip()
     return ""
 
 
-def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[List[str], str]:
+def fetch_tracking_numbers_and_provider(auth_token: str, store_id: str, order_id: int) -> Tuple[List[str], str]:
     """
     Pull tracking numbers from shipments endpoint; if empty, fall back to shipping_addresses.
     Dedupes and preserves order.
@@ -285,7 +280,7 @@ def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[L
     provider = ""
 
     url_ship = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipments"
-    shipments = bc_get_json(url_ship)
+    shipments = bc_get_json(auth_token, url_ship)
 
     if isinstance(shipments, list):
         for sh in shipments:
@@ -299,7 +294,7 @@ def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[L
 
     if not tracking_numbers:
         url_addr = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}/shipping_addresses"
-        addrs = bc_get_json(url_addr)
+        addrs = bc_get_json(auth_token, url_addr)
         if isinstance(addrs, list):
             for a in addrs:
                 tn = (a.get("tracking_number", "") or "").strip()
@@ -318,9 +313,9 @@ def fetch_tracking_numbers_and_provider(store_id: str, order_id: int) -> Tuple[L
     return deduped, provider
 
 
-def update_order_status(store_id: str, order_id: int, new_status_id: int) -> None:
+def update_order_status(auth_token: str, store_id: str, order_id: int, new_status_id: int) -> None:
     url = f"{BC_BASE_URL}/{store_id}/v2/orders/{order_id}"
-    bc_put_json(url, {"status_id": new_status_id})
+    bc_put_json(auth_token, url, {"status_id": new_status_id})
 
 
 # ----------------------------
@@ -419,7 +414,7 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
 
 
 def _md_escape_pipes(s: str) -> str:
-    return (s or "").replace("|", "\\|")  # avoids python invalid escape warnings
+    return (s or "").replace("|", "\\|")
 
 
 def write_alert_markdown(alert_path: str, title: str, intro: str, rows: List[Dict[str, Any]]) -> None:
@@ -430,7 +425,6 @@ def write_alert_markdown(alert_path: str, title: str, intro: str, rows: List[Dic
     lines.append(intro)
     lines.append("")
     if rows:
-        # Expect rows with: order_id, shipping_method, tracking_number(optional), reason(optional), notes(optional)
         headers = ["Order ID", "Shipping Method", "Tracking #", "Reason", "Notes"]
         lines.append("| " + " | ".join(headers) + " |")
         lines.append("|---:|---|---|---|---|")
@@ -456,7 +450,10 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    store_id = _get_env("BC_STORE_ID", required=True)
+    # Required BC envs
+    store_id = _get_env("BC_STORE_ID", required=True).strip()
+    bc_auth_token = _get_env("BC_AUTH_TOKEN", required=True).strip()
+
     shipped_status_id = 2
     completed_status_id = 10
 
@@ -486,7 +483,7 @@ def main() -> int:
     cached_orders: Dict[str, Any] = state["orders"]
 
     logging.info("Fetching BigCommerce orders in status_id=2 (Shipped)...")
-    orders = list_orders_by_status(store_id, shipped_status_id, limit=250)
+    orders = list_orders_by_status(bc_auth_token, store_id, shipped_status_id, limit=250)
     shipped_ids = [int(o.get("id")) for o in orders if isinstance(o, dict) and o.get("id") is not None]
     shipped_ids_set = set(shipped_ids)
     logging.info(f"Found {len(shipped_ids)} shipped orders.")
@@ -510,8 +507,8 @@ def main() -> int:
         if oid_key in cached_orders:
             continue
 
-        shipping_method = fetch_shipping_method(store_id, oid)
-        tracking_numbers, provider = fetch_tracking_numbers_and_provider(store_id, oid)
+        shipping_method = fetch_shipping_method(bc_auth_token, store_id, oid)
+        tracking_numbers, provider = fetch_tracking_numbers_and_provider(bc_auth_token, store_id, oid)
 
         cached_orders[oid_key] = {
             "order_id": oid,
@@ -542,7 +539,6 @@ def main() -> int:
         oid = int(info.get("order_id"))
         sm = info.get("shipping_method") or ""
 
-        # Missing: no usable tracking at all (or only blanks)
         usable = [str(t).strip() for t in tns if str(t).strip() != ""]
         if not usable:
             missing_tracking_rows.append({
@@ -554,7 +550,6 @@ def main() -> int:
             })
             continue
 
-        # Invalid: any obviously invalid tracking number should alert + block completion
         for tn in usable:
             is_bad, reason = classify_tracking_number(tn)
             if is_bad:
@@ -615,7 +610,7 @@ def main() -> int:
                 logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
             else:
                 try:
-                    update_order_status(store_id, oid, completed_status_id)
+                    update_order_status(bc_auth_token, store_id, oid, completed_status_id)
                     logging.info(f"Set order {oid} -> Completed.")
                 except Exception as e:
                     logging.error(f"Failed to set order {oid} -> Completed: {e}")
@@ -625,7 +620,6 @@ def main() -> int:
     # ----------------------------
     # 2) Ship By Weight => FedEx check (but NEVER complete if missing/invalid exists)
     # ----------------------------
-    # Build a set of orders that are blocked due to missing/invalid tracking.
     blocked_order_ids = set()
     for r in missing_tracking_rows:
         blocked_order_ids.add(int(r["order_id"]))
@@ -641,17 +635,14 @@ def main() -> int:
 
         oid = int(info["order_id"])
         if oid in blocked_order_ids:
-            # Missing or invalid tracking => do NOT FedEx-check for completion purposes
             continue
 
         tns = [str(t).strip() for t in (info.get("tracking_numbers") or []) if str(t).strip() != ""]
         if not tns:
-            continue  # already handled as missing
+            continue
 
-        # Only check FedEx for providers that are FedEx OR unspecified
         provider = str(info.get("shipping_provider") or "").strip().lower()
         if provider and "fedex" not in provider:
-            # If you later want UPS/USPS checks, this is where you'd branch
             continue
 
         last_check = info.get("last_fedex_check_utc")
@@ -660,7 +651,6 @@ def main() -> int:
             continue
 
         for tn in tns:
-            # also skip anything that is now “obviously invalid” (defense in depth)
             is_bad, _ = classify_tracking_number(tn)
             if is_bad:
                 blocked_order_ids.add(oid)
@@ -669,7 +659,6 @@ def main() -> int:
             tns_to_check.append(tn)
             tn_to_orders.setdefault(tn, []).append(oid)
 
-    # Unique list
     uniq_tns: List[str] = []
     seen = set()
     for tn in tns_to_check:
@@ -722,7 +711,6 @@ def main() -> int:
                 tn_delivered[summary.tracking_number] = delivered
                 tn_status[summary.tracking_number] = summary.latest_status
 
-        # If FedEx didn't recognize some tracking numbers at all, treat them as invalid and alert + block completion.
         fedex_unrecognized_rows: List[Dict[str, Any]] = []
         for tn in uniq_tns:
             tn_norm = tn.strip()
@@ -730,9 +718,7 @@ def main() -> int:
             if tn_norm in tn_seen_in_response or tn_alt in tn_seen_in_response:
                 continue
 
-            # Mark as invalid (unrecognized by FedEx)
             for oid in tn_to_orders.get(tn, []):
-                # avoid duplicates in the issue
                 fedex_unrecognized_rows.append({
                     "order_id": oid,
                     "shipping_method": cached_orders.get(str(oid), {}).get("shipping_method", ""),
@@ -743,9 +729,7 @@ def main() -> int:
                 blocked_order_ids.add(oid)
 
         if fedex_unrecognized_rows:
-            # Merge into invalid alert file + outputs (append behavior by rewriting full combined list)
             combined = invalid_tracking_rows + fedex_unrecognized_rows
-            # de-dupe combined by (order_id, tracking_number, reason)
             dedup = []
             seen_keys = set()
             for r in combined:
@@ -765,7 +749,6 @@ def main() -> int:
             _write_step_output("invalid_tracking", "true")
             _write_step_output("invalid_tracking_count", str(len(dedup)))
 
-        # Optional: FedEx empty batches alert file
         if fedex_empty_batches > 0:
             write_alert_markdown(
                 fedex_empty_path,
@@ -776,7 +759,6 @@ def main() -> int:
             _write_step_output("fedex_empty", "true")
             _write_step_output("fedex_empty_count", str(fedex_empty_batches))
 
-        # Determine which orders can be completed
         to_complete_after_fedex: List[int] = []
 
         for _, info in cached_orders.items():
@@ -785,7 +767,6 @@ def main() -> int:
 
             oid = int(info["order_id"])
             if oid in blocked_order_ids:
-                # Critical: ANY missing/invalid/unrecognized tracking blocks completion
                 continue
 
             tns = [str(t).strip() for t in (info.get("tracking_numbers") or []) if str(t).strip() != ""]
@@ -817,7 +798,6 @@ def main() -> int:
             info["tracking_delivered"] = tracking_delivered
             info["tracking_status"] = tracking_status
 
-            # Must have all delivered
             all_delivered = True
             for tn in tns:
                 if tracking_delivered.get(tn) is not True:
@@ -835,7 +815,7 @@ def main() -> int:
                     logging.info(f"[DRY_RUN] Would set order {oid} -> status_id={completed_status_id}")
                 else:
                     try:
-                        update_order_status(store_id, oid, completed_status_id)
+                        update_order_status(bc_auth_token, store_id, oid, completed_status_id)
                         logging.info(f"Set order {oid} -> Completed.")
                     except Exception as e:
                         logging.error(f"Failed to set order {oid} -> Completed: {e}")
