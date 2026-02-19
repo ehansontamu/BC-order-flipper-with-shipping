@@ -47,7 +47,13 @@ jobs:
           FEDEX_ENV: prod  # or sandbox
 
           STATE_PATH: .cache/shipped_state.json
+
+          # Existing alert file (missing tracking)
           ALERT_PATH: .cache/missing_tracking.md
+
+          # New alert files for the updated python script
+          FEDEX_EMPTY_ALERT_PATH: .cache/fedex_empty.md
+          INVALID_TRACKING_ALERT_PATH: .cache/invalid_tracking.md
 
           MIN_FEDEX_CHECK_INTERVAL_SEC: "600"   # 10 minutes
           MAX_ORDERS_PER_RUN: "0"               # 0 = no cap
@@ -69,7 +75,98 @@ jobs:
             const title = 'ALERT: Ship By Weight orders missing tracking number';
             const labels = ['ops','shipping','alert'];
 
-            // Look for an existing open issue with this exact title (to avoid spam).
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `New occurrence detected in run ${context.runId}:\n\n${body}`
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                labels
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body: `Detected in run ${context.runId}:\n\n${body}`,
+                labels
+              });
+            }
+
+      - name: Create / update GitHub Issue if FedEx returns empty/unusable results
+        if: steps.run.outputs.fedex_empty == 'true'
+        uses: actions/github-script@v7
+        env:
+          ALERT_PATH: .cache/fedex_empty.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.ALERT_PATH || '.cache/fedex_empty.md';
+            const body = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'See workflow logs for details.';
+            const title = 'ALERT: FedEx returned empty/unusable tracking results';
+            const labels = ['ops','shipping','alert','fedex'];
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `New occurrence detected in run ${context.runId}:\n\n${body}`
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                labels
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body: `Detected in run ${context.runId}:\n\n${body}`,
+                labels
+              });
+            }
+
+      - name: Create / update GitHub Issue if invalid FedEx tracking numbers are detected
+        if: steps.run.outputs.invalid_tracking == 'true'
+        uses: actions/github-script@v7
+        env:
+          ALERT_PATH: .cache/invalid_tracking.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.ALERT_PATH || '.cache/invalid_tracking.md';
+            const body = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'See workflow logs for details.';
+            const title = 'ALERT: Invalid FedEx tracking numbers detected';
+            const labels = ['ops','shipping','alert','fedex'];
+
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
